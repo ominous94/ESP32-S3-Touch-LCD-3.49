@@ -105,7 +105,7 @@ extern "C" void app_main(void)
         io_config.lcd_cmd_bits = 32;         
         io_config.lcd_param_bits = 8;        
         io_config.flags.quad_mode = true;                         
-	ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(LCD_HOST, &io_config, &panel_io));
+	ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST, &io_config, &panel_io));
     
 	axs15231b_vendor_config_t vendor_config = {};
         vendor_config.flags.use_qspi_interface = 1;
