@@ -16,6 +16,7 @@ class CodexStatusStartScriptsTests(unittest.TestCase):
         self.assertIn("codex_status_bridge.py", text)
         self.assertIn("--watch", text)
         self.assertIn("--sessions-file", text)
+        self.assertIn("--viewed-file", text)
         self.assertIn("--host", text)
         self.assertIn("--port", text)
         self.assertIn("logs", text)

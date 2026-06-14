@@ -34,6 +34,7 @@ class CodexStatusBridgeTests(unittest.TestCase):
                         "updated_at": "2026-06-12 09:30:00",
                         "sessions": [
                             {
+                                "id": "thread-active",
                                 "title": STATUS_TITLE,
                                 "state": "active",
                                 "cwd": "ESP32-S3-Touch-LCD-3.49",
@@ -56,6 +57,7 @@ class CodexStatusBridgeTests(unittest.TestCase):
         self.assertEqual(len(payload["sessions"]), 2)
 
         first = payload["sessions"][0]
+        self.assertEqual(first["id"], "thread-active")
         self.assertEqual(first["title"], STATUS_TITLE)
         self.assertEqual(first["state"], "active")
         self.assertEqual(first["status_zh"], WORKING_ZH)
@@ -122,6 +124,36 @@ class CodexStatusBridgeTests(unittest.TestCase):
                 self.assertNotIn("\\u72b6", body)
             finally:
                 server.shutdown()
+
+    def test_viewed_endpoint_records_session_id(self):
+        with TemporaryDirectory() as temp_dir:
+            viewed_file = Path(temp_dir) / "viewed_sessions.json"
+            server = StatusServer(host="127.0.0.1", port=0, viewed_file=viewed_file)
+            self.addCleanup(server.server_close)
+
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+
+            try:
+                url = f"http://127.0.0.1:{server.port}/viewed?id=thread-done"
+                for _ in range(20):
+                    try:
+                        with urlopen(url, timeout=1) as response:
+                            body = response.read().decode("utf-8")
+                        break
+                    except (OSError, socket.timeout):
+                        time.sleep(0.05)
+                else:
+                    self.fail("viewed endpoint did not respond")
+
+                payload = json.loads(body)
+                stored = json.loads(viewed_file.read_text(encoding="utf-8"))
+            finally:
+                server.shutdown()
+
+        self.assertEqual(payload["ok"], True)
+        self.assertIn("thread-done", stored)
+        self.assertIn("viewed_at", stored["thread-done"])
 
 
 if __name__ == "__main__":

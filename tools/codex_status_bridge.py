@@ -3,11 +3,12 @@ import json
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 
 STATE_LABELS_ZH = {
     "active": "\u5de5\u4f5c\u4e2d",
-    "notLoaded": "\u672a\u52a0\u8f7d",
+    "notLoaded": "\u672a\u8fd0\u884c",
     "complete": "\u5df2\u5b8c\u6210",
     "blocked": "\u5df2\u963b\u585e",
 }
@@ -42,6 +43,7 @@ def _normalize_session(session, payload_updated_at):
 
     state = _string_value(session.get("state"), "notLoaded")
     return {
+        "id": _string_value(session.get("id")),
         "title": _string_value(session.get("title"), UNTITLED_SESSION_ZH),
         "state": state,
         "status_zh": _string_value(
@@ -51,6 +53,24 @@ def _normalize_session(session, payload_updated_at):
         "updated_at": _string_value(session.get("updated_at"), payload_updated_at),
         "detail": _string_value(session.get("detail")),
     }
+
+
+def record_viewed_session(viewed_file, session_id):
+    if not viewed_file or not session_id:
+        return False
+
+    path = Path(viewed_file)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    except (OSError, json.JSONDecodeError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+
+    data[str(session_id)] = {"viewed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return True
 
 
 def build_status_payload(sessions_file=None):
@@ -72,7 +92,19 @@ def build_status_payload(sessions_file=None):
 
 class _StatusHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path != "/status":
+        parsed = urlparse(self.path)
+        if parsed.path == "/viewed":
+            session_id = parse_qs(parsed.query).get("id", [""])[0]
+            ok = record_viewed_session(self.server.viewed_file, session_id)
+            body = json.dumps({"ok": ok}, ensure_ascii=False).encode("utf-8")
+            self.send_response(200 if ok else 400)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if parsed.path != "/status":
             self.send_response(404)
             self.end_headers()
             return
@@ -91,10 +123,11 @@ class _StatusHandler(BaseHTTPRequestHandler):
 
 
 class StatusServer(ThreadingHTTPServer):
-    def __init__(self, host="0.0.0.0", port=8787, sessions_file=None):
+    def __init__(self, host="0.0.0.0", port=8787, sessions_file=None, viewed_file=None):
         super().__init__((host, port), _StatusHandler)
         self.port = self.server_address[1]
         self.sessions_file = sessions_file
+        self.viewed_file = viewed_file
 
 
 def main():
@@ -102,9 +135,15 @@ def main():
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", default=8787, type=int)
     parser.add_argument("--sessions-file", help="Read exported Codex sessions from this JSON file.")
+    parser.add_argument("--viewed-file", help="Persist session IDs viewed from the ESP32.")
     args = parser.parse_args()
 
-    server = StatusServer(host=args.host, port=args.port, sessions_file=args.sessions_file)
+    server = StatusServer(
+        host=args.host,
+        port=args.port,
+        sessions_file=args.sessions_file,
+        viewed_file=args.viewed_file,
+    )
     print(f"Serving Codex status at http://{args.host}:{server.port}/status")
     try:
         server.serve_forever()

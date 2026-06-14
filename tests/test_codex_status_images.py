@@ -88,6 +88,8 @@ class CodexStatusImageTests(unittest.TestCase):
 
         self.assertIn("int session_index = order[i + 1];", sketch)
         self.assertNotIn("int session_index = order[i];", sketch)
+        self.assertIn("static const int VISIBLE_SESSIONS = 5;", sketch)
+        self.assertIn("static const int SECONDARY_SESSIONS = 4;", sketch)
 
     def test_layout_a_text_containers_are_fixed_and_non_scrollable(self):
         sketch = SKETCH_FILE.read_text(encoding="utf-8")
@@ -96,6 +98,8 @@ class CodexStatusImageTests(unittest.TestCase):
         self.assertIn("SECONDARY_TITLE_W", sketch)
         self.assertIn("lv_obj_clear_flag(primary_panel, LV_OBJ_FLAG_SCROLLABLE)", sketch)
         self.assertIn("lv_obj_clear_flag(secondary_cards[i], LV_OBJ_FLAG_SCROLLABLE)", sketch)
+        self.assertIn("lv_obj_add_flag(secondary_panel, LV_OBJ_FLAG_SCROLLABLE)", sketch)
+        self.assertIn("lv_obj_set_scroll_dir(secondary_panel, LV_DIR_VER)", sketch)
         self.assertIn("lv_label_set_long_mode(primary_title_label, LV_LABEL_LONG_DOT)", sketch)
         self.assertIn("lv_label_set_long_mode(secondary_titles[i], LV_LABEL_LONG_DOT)", sketch)
         self.assertNotIn("lv_obj_set_height(session_rows[i], SESSION_ROW_H)", sketch)
@@ -104,6 +108,8 @@ class CodexStatusImageTests(unittest.TestCase):
     def test_sketch_adds_content_only_session_detail_page(self):
         sketch = SKETCH_FILE.read_text(encoding="utf-8")
 
+        self.assertIn("String id;", sketch)
+        self.assertIn('json_string_value(object_json, "id")', sketch)
         self.assertIn("String detail;", sketch)
         self.assertIn('json_string_value(object_json, "detail")', sketch)
         self.assertIn("enum CodexPage", sketch)
@@ -125,6 +131,8 @@ class CodexStatusImageTests(unittest.TestCase):
         self.assertIn("render_home_ui_locked", sketch)
         self.assertIn("LV_OBJ_FLAG_EVENT_BUBBLE", sketch)
         self.assertIn("CODEX_STATUS detail_open", sketch)
+        self.assertIn("mark_session_viewed", sketch)
+        self.assertIn("/viewed?id=", sketch)
         self.assertIn("CODEX_STATUS detail_back", sketch)
         self.assertNotIn("create_detail_ui();\n}", sketch)
         self.assertNotIn("create_status_ui();\n  update_status_ui", sketch)
@@ -133,6 +141,8 @@ class CodexStatusImageTests(unittest.TestCase):
         sketch = SKETCH_FILE.read_text(encoding="utf-8")
 
         self.assertIn("session_press_cancelled", sketch)
+        self.assertIn("SESSION_DRAG_CANCEL_PX", sketch)
+        self.assertIn("session_press_start", sketch)
         self.assertIn("back_press_cancelled", sketch)
         self.assertIn("session_feedback_event_cb", sketch)
         self.assertIn("detail_back_feedback_event_cb", sketch)
@@ -144,6 +154,7 @@ class CodexStatusImageTests(unittest.TestCase):
         self.assertIn("session_pointer_inside", sketch)
         self.assertIn("lv_indev_get_point", sketch)
         self.assertIn("lv_obj_get_coords", sketch)
+        self.assertIn("session_drag_exceeded", sketch)
         self.assertIn("session_press_cancelled[slot] = true;", sketch)
         self.assertIn("if (session_press_cancelled[slot]) return;", sketch)
         self.assertIn("if (!session_pointer_inside(target)) return;", sketch)
@@ -152,6 +163,10 @@ class CodexStatusImageTests(unittest.TestCase):
         self.assertIn("set_card_pressed_feedback", sketch)
         self.assertIn("set_back_button_pressed_feedback", sketch)
         self.assertIn("lv_obj_set_size(detail_back_button, 68, 44);", sketch)
+        self.assertIn("lv_obj_set_size(content_panel, DETAIL_CONTENT_W, PANEL_H);", sketch)
+        self.assertIn("lv_obj_set_size(back_panel, DETAIL_BACK_PANEL_W, PANEL_H);", sketch)
+        self.assertIn("lv_obj_create(screen);\n  lv_obj_set_size(content_panel", sketch)
+        self.assertIn("lv_obj_create(screen);\n  lv_obj_set_size(back_panel", sketch)
         self.assertIn("lv_obj_set_style_text_align(back_label, LV_TEXT_ALIGN_CENTER, 0);", sketch)
         self.assertIn("if (lv_event_get_code(event) != LV_EVENT_RELEASED) return;", sketch)
         self.assertIn("lv_obj_add_event_cb(primary_panel, session_card_event_cb, LV_EVENT_RELEASED", sketch)

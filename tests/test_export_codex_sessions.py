@@ -1,5 +1,8 @@
 import json
+import os
+import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -9,7 +12,8 @@ from tools.export_codex_sessions import build_sessions_payload, export_sessions
 STATUS_TITLE = "\u72b6\u6001\u5c4f\u5f00\u53d1"
 OTHER_TITLE = "\u771f\u673a\u6d4b\u8bd5"
 WORKING_ZH = "\u5de5\u4f5c\u4e2d"
-IDLE_ZH = "\u672a\u52a0\u8f7d"
+IDLE_ZH = "\u672a\u8fd0\u884c"
+DONE_ZH = "\u5df2\u5b8c\u6210"
 USER_DETAIL = "\u7528\u6237\uff1a\u6253\u5f00\u8be6\u60c5\u9875"
 ASSISTANT_DETAIL = "\u52a9\u624b\uff1a\u6b63\u5728\u5236\u5b9a\u5b9e\u73b0\u65b9\u6848"
 
@@ -60,8 +64,8 @@ class ExportCodexSessionsTests(unittest.TestCase):
 
         self.assertEqual(len(payload["sessions"]), 2)
         self.assertEqual(payload["sessions"][0]["title"], STATUS_TITLE)
-        self.assertEqual(payload["sessions"][0]["state"], "active")
-        self.assertEqual(payload["sessions"][0]["status_zh"], WORKING_ZH)
+        self.assertEqual(payload["sessions"][0]["state"], "notLoaded")
+        self.assertEqual(payload["sessions"][0]["status_zh"], IDLE_ZH)
         self.assertEqual(payload["sessions"][0]["cwd"], "ESP32-S3-Touch-LCD-3.49")
         self.assertEqual(payload["sessions"][1]["title"], OTHER_TITLE)
         self.assertEqual(payload["sessions"][1]["state"], "notLoaded")
@@ -90,6 +94,166 @@ class ExportCodexSessionsTests(unittest.TestCase):
 
         self.assertEqual(payload["sessions"][0]["title"], STATUS_TITLE)
         self.assertEqual(payload["sessions"][0]["state"], "notLoaded")
+
+    def test_build_sessions_payload_marks_task_complete_rollout_as_complete(self):
+        with TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir) / ".codex"
+            rollout_dir = codex_home / "sessions" / "2026" / "06" / "14"
+            rollout_dir.mkdir(parents=True)
+            (rollout_dir / "rollout-2026-06-14T09-00-00-thread-done.jsonl").write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "timestamp": "2026-06-14T09:00:00.000Z",
+                                "type": "session_meta",
+                                "payload": {
+                                    "id": "thread-done",
+                                    "cwd": "F:\\CodexProject\\ESP32-S3-Touch-LCD-3.49",
+                                },
+                            },
+                            ensure_ascii=False,
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": "2026-06-14T09:01:00.000Z",
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": [{"type": "input_text", "text": STATUS_TITLE}],
+                                },
+                            },
+                            ensure_ascii=False,
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": "2026-06-14T09:02:00.000Z",
+                                "type": "event_msg",
+                                "payload": {"type": "task_complete"},
+                            },
+                            ensure_ascii=False,
+                        ),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            payload = build_sessions_payload(
+                codex_home=codex_home,
+                now=datetime(2026, 6, 14, 9, 5, 0, tzinfo=timezone.utc),
+                limit=1,
+            )
+
+        self.assertEqual(payload["sessions"][0]["title"], STATUS_TITLE)
+        self.assertEqual(payload["sessions"][0]["state"], "complete")
+        self.assertEqual(payload["sessions"][0]["status_zh"], DONE_ZH)
+
+    def test_viewed_complete_session_is_exported_as_not_loaded(self):
+        with TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir) / ".codex"
+            rollout_dir = codex_home / "sessions" / "2026" / "06" / "14"
+            viewed_file = Path(temp_dir) / "viewed_sessions.json"
+            rollout_dir.mkdir(parents=True)
+            (rollout_dir / "rollout-2026-06-14T09-00-00-thread-viewed.jsonl").write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "timestamp": "2026-06-14T09:00:00.000Z",
+                                "type": "session_meta",
+                                "payload": {"id": "thread-viewed"},
+                            },
+                            ensure_ascii=False,
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": "2026-06-14T09:01:00.000Z",
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": [{"type": "input_text", "text": STATUS_TITLE}],
+                                },
+                            },
+                            ensure_ascii=False,
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": "2026-06-14T09:02:00.000Z",
+                                "type": "event_msg",
+                                "payload": {"type": "task_complete"},
+                            },
+                            ensure_ascii=False,
+                        ),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            viewed_file.write_text(
+                json.dumps({"thread-viewed": {"viewed_at": "2026-06-14 09:03:00"}}),
+                encoding="utf-8",
+            )
+
+            payload = build_sessions_payload(
+                codex_home=codex_home,
+                viewed_file=viewed_file,
+                limit=1,
+            )
+
+        self.assertEqual(payload["sessions"][0]["id"], "thread-viewed")
+        self.assertEqual(payload["sessions"][0]["state"], "notLoaded")
+        self.assertEqual(payload["sessions"][0]["status_zh"], IDLE_ZH)
+
+    def test_complete_session_older_than_ten_minutes_is_exported_as_not_loaded(self):
+        with TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir) / ".codex"
+            rollout_dir = codex_home / "sessions" / "2026" / "06" / "14"
+            rollout_dir.mkdir(parents=True)
+            (rollout_dir / "rollout-2026-06-14T09-00-00-thread-stale-done.jsonl").write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "timestamp": "2026-06-14T09:00:00.000Z",
+                                "type": "session_meta",
+                                "payload": {"id": "thread-stale-done"},
+                            },
+                            ensure_ascii=False,
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": "2026-06-14T09:01:00.000Z",
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": [{"type": "input_text", "text": STATUS_TITLE}],
+                                },
+                            },
+                            ensure_ascii=False,
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": "2026-06-14T09:02:00.000Z",
+                                "type": "event_msg",
+                                "payload": {"type": "task_complete"},
+                            },
+                            ensure_ascii=False,
+                        ),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            payload = build_sessions_payload(
+                codex_home=codex_home,
+                now=datetime(2026, 6, 14, 9, 13, 0, tzinfo=timezone.utc),
+                limit=1,
+            )
+
+        self.assertEqual(payload["sessions"][0]["state"], "notLoaded")
+        self.assertEqual(payload["sessions"][0]["status_zh"], IDLE_ZH)
 
     def test_exported_titles_are_limited_for_two_line_display(self):
         long_title = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -174,6 +338,14 @@ class ExportCodexSessionsTests(unittest.TestCase):
                             },
                             ensure_ascii=False,
                         ),
+                        json.dumps(
+                            {
+                                "timestamp": "2026-06-12T03:26:00.000Z",
+                                "type": "event_msg",
+                                "payload": {"type": "turn_started"},
+                            },
+                            ensure_ascii=False,
+                        ),
                     ]
                 ),
                 encoding="utf-8",
@@ -185,6 +357,107 @@ class ExportCodexSessionsTests(unittest.TestCase):
         self.assertEqual(payload["sessions"][0]["state"], "active")
         self.assertEqual(payload["sessions"][0]["cwd"], "ESP32-S3-Touch-LCD-3.49")
         self.assertEqual(payload["sessions"][1]["title"], OTHER_TITLE)
+
+    def test_build_sessions_payload_prioritizes_active_sessions_before_limit(self):
+        with TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir) / ".codex"
+            rollout_dir = codex_home / "sessions" / "2026" / "06" / "14"
+            rollout_dir.mkdir(parents=True)
+
+            completed_entries = []
+            for index in range(5):
+                completed_entries.append(
+                    json.dumps(
+                        {
+                            "id": f"thread-done-{index}",
+                            "thread_name": f"已完成会话 {index}",
+                            "updated_at": f"2026-06-14T10:0{index}:00Z",
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            (codex_home / "session_index.jsonl").write_text(
+                "\n".join(completed_entries),
+                encoding="utf-8",
+            )
+
+            for index in range(5):
+                done_rollout = rollout_dir / f"rollout-2026-06-14T10-0{index}-00-thread-done-{index}.jsonl"
+                done_rollout.write_text(
+                    "\n".join(
+                        [
+                            json.dumps(
+                                {
+                                    "timestamp": f"2026-06-14T10:0{index}:00.000Z",
+                                    "type": "session_meta",
+                                    "payload": {"id": f"thread-done-{index}"},
+                                },
+                                ensure_ascii=False,
+                            ),
+                            json.dumps(
+                                {
+                                    "timestamp": f"2026-06-14T10:0{index}:10.000Z",
+                                    "type": "event_msg",
+                                    "payload": {"type": "task_complete"},
+                                },
+                                ensure_ascii=False,
+                            ),
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+
+            active_rollout = rollout_dir / "rollout-2026-06-14T09-00-00-thread-active.jsonl"
+            active_rollout.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "timestamp": "2026-06-14T09:00:00.000Z",
+                                "type": "session_meta",
+                                "payload": {"id": "thread-active"},
+                            },
+                            ensure_ascii=False,
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": "2026-06-14T09:00:10.000Z",
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": [{"type": "input_text", "text": STATUS_TITLE}],
+                                },
+                            },
+                            ensure_ascii=False,
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": "2026-06-14T09:00:20.000Z",
+                                "type": "event_msg",
+                                "payload": {"type": "turn_started"},
+                            },
+                            ensure_ascii=False,
+                        ),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            os.utime(active_rollout, (time.time(), time.time()))
+
+            payload = build_sessions_payload(
+                codex_home=codex_home,
+                now=datetime(2026, 6, 14, 10, 5, 0, tzinfo=timezone.utc),
+                limit=5,
+            )
+
+        self.assertEqual(len(payload["sessions"]), 5)
+        self.assertEqual(payload["sessions"][0]["title"], STATUS_TITLE)
+        self.assertEqual(payload["sessions"][0]["state"], "active")
+        self.assertIn(
+            "complete",
+            {session["state"] for session in payload["sessions"][1:]},
+        )
 
     def test_build_sessions_payload_exports_recent_conversation_detail(self):
         with TemporaryDirectory() as temp_dir:

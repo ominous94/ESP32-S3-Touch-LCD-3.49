@@ -91,6 +91,13 @@ verify_codex_status.cmd --skip-compile --skip-upload
 - For this board, successful serial verification normally shows `CODEX_STATUS boot`, `CODEX_STATUS wifi_connected`, `CODEX_STATUS http_ok`, `CODEX_STATUS ui_update`, and one or more `CODEX_STATUS session` lines.
 - Do not claim a firmware change is verified unless the relevant command has passed in the current session and the serial log confirms the expected `CODEX_STATUS` events.
 
+## Session State Detection
+
+- 会话"工作中/未加载"的判定在 `tools/export_codex_sessions.py` 的 `_is_active_entry`，**不要**回退到旧的"看 cwd 是否在 `active-workspace-roots` 里"逻辑——那是 Codex Desktop 的"打开的工作区"列表，不代表里面的会话还在跑，会把所有历史会话错标为 active。
+- 当前判定：`_read_rollout_sessions` 给每条 entry 记录 `last_event_msg_type` 和 `rollout_mtime`，`_is_active_entry` 要求最后一条 `event_msg` 不是 `task_complete`/`error`/`shutdown_complete`，且 rollout 文件 mtime 在 `ACTIVE_RECENT_SECONDS`（默认 120s）内。
+- 修改 exporter 后必须重启 exporter 进程（`logs/codex_status_exporter.pid`）才能生效；bridge 不需要重启，sketch 也不用重新部署。
+- 调试方法：直接 curl `http://127.0.0.1:8787/status`，对比 `sessions.json` 与 rollout 文件最后几行，看 active/notLoaded 是否符合预期。
+
 ## Compile Lessons
 
 - Detailed compile record: `Examples/Arduino/12_Codex_Status/Issue_record.md`.

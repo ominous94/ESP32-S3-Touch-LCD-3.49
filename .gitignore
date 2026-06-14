@@ -17,6 +17,7 @@ reasonix.toml
 # Runtime data captured by the Codex Status bridge / exporter
 sessions.json
 sessions_check.json
+viewed_sessions.json
 
 # One-off error log dumps
 ErrorLog.txt

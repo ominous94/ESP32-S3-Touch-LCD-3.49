@@ -8,11 +8,15 @@ from pathlib import Path
 
 STATE_LABELS_ZH = {
     "active": "\u5de5\u4f5c\u4e2d",
-    "notLoaded": "\u672a\u52a0\u8f7d",
+    "notLoaded": "\u672a\u8fd0\u884c",
+    "complete": "\u5df2\u5b8c\u6210",
+    "blocked": "\u5df2\u963b\u585e",
 }
 MAX_SCREEN_TITLE_CHARS = 24
 MAX_DETAIL_MESSAGES = 4
 MAX_DETAIL_CHARS = 260
+ACTIVE_RECENT_SECONDS = 120
+COMPLETE_VISIBLE_SECONDS = 600
 
 
 def _default_codex_home():
@@ -24,6 +28,13 @@ def _read_json_file(path):
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
+
+
+def _read_viewed_sessions(viewed_file):
+    if not viewed_file:
+        return {}
+    data = _read_json_file(Path(viewed_file))
+    return data if isinstance(data, dict) else {}
 
 
 def _read_session_index(codex_home):
@@ -109,6 +120,7 @@ def _read_rollout_sessions(codex_home, scan_limit=20):
         except OSError:
             continue
 
+        last_event_msg_type = ""
         for line in lines:
             try:
                 event = json.loads(line)
@@ -127,11 +139,22 @@ def _read_rollout_sessions(codex_home, scan_limit=20):
                 detail_line = _detail_line_from_message_payload(event.get("payload"))
                 if detail_line:
                     entry.setdefault("detail_lines", []).append(detail_line)
+            if event.get("type") == "event_msg" and isinstance(event.get("payload"), dict):
+                msg_type = str(event["payload"].get("type") or "")
+                if msg_type:
+                    last_event_msg_type = msg_type
+                    if msg_type in {"task_complete", "shutdown_complete"}:
+                        entry["completed_at"] = str(event.get("timestamp") or "")
 
         if entry.get("id"):
             entry.setdefault("thread_name", "\u672a\u547d\u540d\u4f1a\u8bdd")
             entry["detail"] = _screen_detail(entry.get("detail_lines", []))
             entry.pop("detail_lines", None)
+            entry["last_event_msg_type"] = last_event_msg_type
+            try:
+                entry["rollout_mtime"] = rollout_file.stat().st_mtime
+            except OSError:
+                entry["rollout_mtime"] = 0.0
             sessions.append(entry)
     return sessions
 
@@ -205,19 +228,77 @@ def _is_active_thread(thread_id, state):
 
 
 def _is_active_entry(entry, state):
-    workspace = _entry_workspace(entry, state)
-    active_roots = state.get("active-workspace-roots")
-    if not workspace or not isinstance(active_roots, list):
+    last_event = str(entry.get("last_event_msg_type") or "")
+    if last_event in {"task_complete", "error", "shutdown_complete"}:
         return False
-    normalized_workspace = os.path.normcase(os.path.abspath(workspace))
-    return any(
-        os.path.normcase(os.path.abspath(str(root))) == normalized_workspace for root in active_roots
-    )
+    rollout_mtime = float(entry.get("rollout_mtime") or 0.0)
+    if rollout_mtime <= 0:
+        return False
+    if (time.time() - rollout_mtime) > ACTIVE_RECENT_SECONDS:
+        return False
+    if not last_event:
+        return False
+    return True
 
 
-def build_sessions_payload(codex_home=None, limit=5):
+def _completion_time(entry):
+    completed_at = _parse_time(entry.get("completed_at"))
+    if completed_at != datetime.min.replace(tzinfo=timezone.utc):
+        return completed_at
+    rollout_mtime = float(entry.get("rollout_mtime") or 0.0)
+    if rollout_mtime > 0:
+        return datetime.fromtimestamp(rollout_mtime, tz=timezone.utc)
+    return _parse_time(entry.get("updated_at"))
+
+
+def _is_viewed_complete(entry, viewed_sessions):
+    thread_id = str(entry.get("id") or "")
+    return bool(thread_id and thread_id in viewed_sessions)
+
+
+def _entry_state(entry, state, viewed_sessions=None, now=None):
+    viewed_sessions = viewed_sessions or {}
+    now = now or datetime.now(timezone.utc)
+    last_event = str(entry.get("last_event_msg_type") or "")
+    if last_event in {"task_complete", "shutdown_complete"}:
+        if _is_viewed_complete(entry, viewed_sessions):
+            return "notLoaded"
+        completed_at = _completion_time(entry)
+        if completed_at != datetime.min.replace(tzinfo=timezone.utc):
+            if completed_at.tzinfo is None:
+                completed_at = completed_at.replace(tzinfo=timezone.utc)
+            if (now - completed_at).total_seconds() > COMPLETE_VISIBLE_SECONDS:
+                return "notLoaded"
+        return "complete"
+    if last_event == "error":
+        return "blocked"
+    if _is_active_entry(entry, state):
+        return "active"
+    return "notLoaded"
+
+
+def _state_priority(state):
+    priorities = {
+        "active": 0,
+        "blocked": 1,
+        "complete": 2,
+        "notLoaded": 3,
+    }
+    return priorities.get(state, 4)
+
+
+def _entry_sort_time(entry):
+    completion = _completion_time(entry)
+    if completion != datetime.min.replace(tzinfo=timezone.utc):
+        return completion
+    return _parse_time(entry.get("updated_at"))
+
+
+def build_sessions_payload(codex_home=None, limit=5, viewed_file=None, now=None):
     codex_home = Path(codex_home) if codex_home else _default_codex_home()
     state = _read_json_file(codex_home / ".codex-global-state.json")
+    viewed_sessions = _read_viewed_sessions(viewed_file)
+    now_dt = now or datetime.now(timezone.utc)
     entries_by_id = {}
     for entry in _read_session_index(codex_home) + _read_rollout_sessions(codex_home):
         thread_id = str(entry.get("id", ""))
@@ -225,37 +306,51 @@ def build_sessions_payload(codex_home=None, limit=5):
             continue
         existing = entries_by_id.get(thread_id)
         if existing is None or _parse_time(entry.get("updated_at")) >= _parse_time(existing.get("updated_at")):
-            entries_by_id[thread_id] = entry
+            merged = dict(entry)
+            if existing:
+                for key in ("last_event_msg_type", "rollout_mtime", "completed_at"):
+                    if key not in merged and key in existing:
+                        merged[key] = existing[key]
+            entries_by_id[thread_id] = merged
+        else:
+            for key in ("last_event_msg_type", "rollout_mtime", "completed_at"):
+                if key in entry and key not in existing:
+                    existing[key] = entry[key]
 
     entries = sorted(
         entries_by_id.values(),
-        key=lambda entry: _parse_time(entry.get("updated_at")),
+        key=_entry_sort_time,
         reverse=True,
+    )
+    entries = sorted(
+        entries,
+        key=lambda entry: _state_priority(_entry_state(entry, state, viewed_sessions, now_dt)),
     )[:limit]
 
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     sessions = []
     for entry in entries:
-        status_state = "active" if _is_active_entry(entry, state) else "notLoaded"
+        status_state = _entry_state(entry, state, viewed_sessions, now_dt)
         workspace = _entry_workspace(entry, state)
         sessions.append(
             {
+                "id": str(entry.get("id") or ""),
                 "title": _screen_title(entry.get("thread_name")),
                 "state": status_state,
                 "status_zh": STATE_LABELS_ZH[status_state],
                 "cwd": _workspace_name(workspace),
-                "updated_at": _format_time(entry.get("updated_at")) or now,
+                "updated_at": _format_time(entry.get("updated_at")) or now_text,
                 "detail": str(entry.get("detail") or ""),
             }
         )
 
-    return {"updated_at": now, "sessions": sessions}
+    return {"updated_at": now_text, "sessions": sessions}
 
 
-def export_sessions(codex_home=None, output_file="sessions.json", limit=5):
+def export_sessions(codex_home=None, output_file="sessions.json", limit=5, viewed_file=None):
     output_path = Path(output_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = build_sessions_payload(codex_home=codex_home, limit=limit)
+    payload = build_sessions_payload(codex_home=codex_home, limit=limit, viewed_file=viewed_file)
     output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return payload
 
@@ -265,12 +360,18 @@ def main():
     parser.add_argument("--codex-home", default=str(_default_codex_home()))
     parser.add_argument("--output", default="sessions.json")
     parser.add_argument("--limit", default=5, type=int)
+    parser.add_argument("--viewed-file", default="")
     parser.add_argument("--watch", action="store_true", help="Continuously refresh the output file.")
     parser.add_argument("--interval", default=1.0, type=float, help="Refresh interval in seconds for --watch.")
     args = parser.parse_args()
 
     while True:
-        payload = export_sessions(codex_home=args.codex_home, output_file=args.output, limit=args.limit)
+        payload = export_sessions(
+            codex_home=args.codex_home,
+            output_file=args.output,
+            limit=args.limit,
+            viewed_file=args.viewed_file,
+        )
         print(f"Exported {len(payload['sessions'])} sessions to {args.output}")
         if not args.watch:
             break

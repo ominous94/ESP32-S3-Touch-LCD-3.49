@@ -37,9 +37,10 @@ const char *WIFI_PASSWORD = "ziroom0503";
 const char *STATUS_URL = "http://192.168.31.222:8787/status";
 
 static const uint32_t STATUS_POLL_INTERVAL_MS = 3000;
+static const int SESSION_DRAG_CANCEL_PX = 12;
 static const int MAX_SESSIONS = 5;
-static const int VISIBLE_SESSIONS = 3;
-static const int SECONDARY_SESSIONS = 2;
+static const int VISIBLE_SESSIONS = 5;
+static const int SECONDARY_SESSIONS = 4;
 static const int COMPANION_PANEL_W = 150;
 static const int PRIMARY_PANEL_W = 318;
 static const int SECONDARY_PANEL_W = 148;
@@ -49,7 +50,7 @@ static const int COMPANION_IMAGE_H = 56;
 static const int PRIMARY_TITLE_W = 286;
 static const int PRIMARY_TEXT_W = 300;
 static const int SECONDARY_TITLE_W = 124;
-static const int SECONDARY_CARD_H = 74;
+static const int SECONDARY_CARD_H = 52;
 static const int PROGRESS_BAR_W = 286;
 static const int DETAIL_BACK_PANEL_W = 86;
 static const int DETAIL_CONTENT_W = 530;
@@ -89,11 +90,13 @@ enum CodexPage {
 static CodexPage current_page = CODEX_PAGE_HOME;
 static String latest_connection;
 static int selected_session_index = -1;
-static int visible_session_indices[VISIBLE_SESSIONS] = {-1, -1, -1};
-static bool session_press_cancelled[VISIBLE_SESSIONS] = {false, false, false};
+static int visible_session_indices[VISIBLE_SESSIONS] = {-1, -1, -1, -1, -1};
+static bool session_press_cancelled[VISIBLE_SESSIONS] = {false, false, false, false, false};
+static lv_point_t session_press_start[VISIBLE_SESSIONS] = {};
 static bool back_press_cancelled = false;
 
 struct CodexSession {
+  String id;
   String title;
   String state;
   String status_zh;
@@ -353,6 +356,7 @@ static CodexStatus parse_status_json(const String &json)
 
     String object_json = json.substring(object_start, object_finish + 1);
     CodexSession &session = status.sessions[status.session_count];
+    session.id = json_string_value(object_json, "id");
     session.title = json_string_value(object_json, "title");
     session.state = json_string_value(object_json, "state");
     session.status_zh = json_string_value(object_json, "status_zh");
@@ -384,7 +388,7 @@ static String status_label_text(const CodexSession &session)
   if (session.state == "active") return "工作中";
   if (session.state == "complete") return "已完成";
   if (session.state == "blocked") return "已阻塞";
-  if (session.state == "notLoaded") return "未加载";
+  if (session.state == "notLoaded") return "未运行";
   return "未知";
 }
 
@@ -408,8 +412,8 @@ static lv_color_t state_color(const String &state)
 
 static int state_rank(const String &state)
 {
-  if (state == "blocked") return 0;
-  if (state == "active") return 1;
+  if (state == "active") return 0;
+  if (state == "blocked") return 1;
   if (state == "complete") return 2;
   if (state == "notLoaded") return 3;
   return 4;
@@ -524,6 +528,24 @@ static bool session_pointer_inside(lv_obj_t *card)
   return point.x >= coords.x1 && point.x <= coords.x2 && point.y >= coords.y1 && point.y <= coords.y2;
 }
 
+static bool active_pointer_point(lv_point_t *point)
+{
+  lv_indev_t *indev = lv_indev_active();
+  if (indev == NULL || point == NULL) return false;
+  lv_indev_get_point(indev, point);
+  return true;
+}
+
+static bool session_drag_exceeded(int slot)
+{
+  if (slot < 0 || slot >= VISIBLE_SESSIONS) return true;
+  lv_point_t point;
+  if (!active_pointer_point(&point)) return false;
+  int dx = abs(point.x - session_press_start[slot].x);
+  int dy = abs(point.y - session_press_start[slot].y);
+  return dx > SESSION_DRAG_CANCEL_PX || dy > SESSION_DRAG_CANCEL_PX;
+}
+
 static void session_feedback_event_cb(lv_event_t *event)
 {
   lv_event_code_t code = lv_event_get_code(event);
@@ -533,10 +555,11 @@ static void session_feedback_event_cb(lv_event_t *event)
 
   if (code == LV_EVENT_PRESSED) {
     session_press_cancelled[slot] = false;
+    active_pointer_point(&session_press_start[slot]);
     if (slot == 0) set_card_pressed_feedback(target, true);
     else set_secondary_card_pressed_feedback(target, true);
   } else if (code == LV_EVENT_PRESSING) {
-    if (!session_press_cancelled[slot] && !session_pointer_inside(target)) {
+    if (!session_press_cancelled[slot] && (session_drag_exceeded(slot) || !session_pointer_inside(target))) {
       session_press_cancelled[slot] = true;
       if (slot == 0) set_card_pressed_feedback(target, false);
       else set_secondary_card_pressed_feedback(target, false);
@@ -546,7 +569,7 @@ static void session_feedback_event_cb(lv_event_t *event)
     if (slot == 0) set_card_pressed_feedback(target, false);
     else set_secondary_card_pressed_feedback(target, false);
   } else if (code == LV_EVENT_RELEASED) {
-    if (!session_pointer_inside(target)) {
+    if (session_drag_exceeded(slot) || !session_pointer_inside(target)) {
       session_press_cancelled[slot] = true;
     }
     if (slot == 0) set_card_pressed_feedback(target, false);
@@ -578,9 +601,37 @@ static void detail_back_feedback_event_cb(lv_event_t *event)
   }
 }
 
+static String viewed_url_for_session(const String &session_id)
+{
+  String base_url = String(STATUS_URL);
+  int status_pos = base_url.lastIndexOf("/status");
+  if (status_pos >= 0) {
+    base_url = base_url.substring(0, status_pos);
+  }
+  return base_url + "/viewed?id=" + session_id;
+}
+
+static void mark_session_viewed(const CodexSession &session)
+{
+  if (session.state != "complete" || !session.id.length()) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  String url = viewed_url_for_session(session.id);
+  HTTPClient http;
+  http.setTimeout(1200);
+  http.begin(url);
+  int code = http.GET();
+  Serial.print("CODEX_STATUS viewed");
+  log_serial_field("id", session.id);
+  log_serial_field("code", code);
+  Serial.println();
+  http.end();
+}
+
 static void open_session_detail(int session_index)
 {
   if (session_index < 0 || session_index >= latest_status.session_count) return;
+  mark_session_viewed(latest_status.sessions[session_index]);
   selected_session_index = session_index;
   current_page = CODEX_PAGE_DETAIL;
   Serial.print("CODEX_STATUS detail_open");
@@ -723,7 +774,8 @@ static void render_home_ui_locked()
 
   lv_obj_t *secondary_panel = lv_obj_create(screen);
   lv_obj_set_size(secondary_panel, SECONDARY_PANEL_W, PANEL_H);
-  lv_obj_clear_flag(secondary_panel, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(secondary_panel, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_scroll_dir(secondary_panel, LV_DIR_VER);
   lv_obj_set_style_bg_opa(secondary_panel, LV_OPA_TRANSP, 0);
   lv_obj_set_style_border_width(secondary_panel, 0, 0);
   lv_obj_set_style_pad_all(secondary_panel, 0, 0);
@@ -770,7 +822,7 @@ static void render_home_ui_locked()
 
     secondary_titles[i] = create_label(secondary_cards[i], "--", lv_color_hex(0xE9EEF2), SECONDARY_TITLE_W);
     make_touch_event_bubble(secondary_titles[i]);
-    lv_obj_set_height(secondary_titles[i], 36);
+    lv_obj_set_height(secondary_titles[i], 20);
     lv_label_set_long_mode(secondary_titles[i], LV_LABEL_LONG_DOT);
     lv_obj_add_flag(secondary_cards[i], LV_OBJ_FLAG_HIDDEN);
   }
@@ -793,6 +845,19 @@ static void render_detail_ui_locked()
   lv_obj_set_style_pad_column(screen, 6, 0);
   lv_obj_set_flex_flow(screen, LV_FLEX_FLOW_ROW);
   lv_obj_set_flex_align(screen, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+
+  lv_obj_t *content_panel = lv_obj_create(screen);
+  lv_obj_set_size(content_panel, DETAIL_CONTENT_W, PANEL_H);
+  lv_obj_set_style_bg_color(content_panel, lv_color_hex(0x151B20), 0);
+  lv_obj_set_style_border_width(content_panel, 0, 0);
+  lv_obj_set_style_radius(content_panel, 6, 0);
+  lv_obj_set_style_pad_all(content_panel, 8, 0);
+  lv_obj_set_scroll_dir(content_panel, LV_DIR_VER);
+
+  detail_content_label = create_label(content_panel, "", lv_color_hex(0xD8E1E7), DETAIL_CONTENT_W - 20);
+  lv_label_set_long_mode(detail_content_label, LV_LABEL_LONG_WRAP);
+  String detail_text = detail_text_for_session(selected_session_index);
+  lv_label_set_text(detail_content_label, detail_text.c_str());
 
   lv_obj_t *back_panel = lv_obj_create(screen);
   lv_obj_set_size(back_panel, DETAIL_BACK_PANEL_W, PANEL_H);
@@ -819,19 +884,6 @@ static void render_detail_ui_locked()
   make_touch_event_bubble(back_label);
   lv_obj_set_style_text_align(back_label, LV_TEXT_ALIGN_CENTER, 0);
   lv_obj_center(back_label);
-
-  lv_obj_t *content_panel = lv_obj_create(screen);
-  lv_obj_set_size(content_panel, DETAIL_CONTENT_W, PANEL_H);
-  lv_obj_set_style_bg_color(content_panel, lv_color_hex(0x151B20), 0);
-  lv_obj_set_style_border_width(content_panel, 0, 0);
-  lv_obj_set_style_radius(content_panel, 6, 0);
-  lv_obj_set_style_pad_all(content_panel, 8, 0);
-  lv_obj_set_scroll_dir(content_panel, LV_DIR_VER);
-
-  detail_content_label = create_label(content_panel, "", lv_color_hex(0xD8E1E7), DETAIL_CONTENT_W - 20);
-  lv_label_set_long_mode(detail_content_label, LV_LABEL_LONG_WRAP);
-  String detail_text = detail_text_for_session(selected_session_index);
-  lv_label_set_text(detail_content_label, detail_text.c_str());
 }
 
 static void create_detail_ui()
