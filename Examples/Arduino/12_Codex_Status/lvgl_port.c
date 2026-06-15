@@ -17,7 +17,7 @@ static const char *TAG = "lvgl_port";
 static SemaphoreHandle_t lvgl_mux = NULL;
 
 static uint16_t *trans_buf_1 = NULL; 
-uint8_t *lvgl_dest = NULL;                //旋转buffer
+static uint8_t *lvgl_dest = NULL;
 static SemaphoreHandle_t flush_done_semaphore;
 
 #define LCD_BIT_PER_PIXEL 16
@@ -53,19 +53,14 @@ static void example_lvgl_flush_cb(lv_display_t * disp, const lv_area_t * area, u
   if(rotation != LV_DISPLAY_ROTATION_0)
   {
     lv_color_format_t cf = lv_display_get_color_format(disp);
-    /*Calculate the position of the rotated area*/
     rotated_area = *area;
     lv_display_rotate_area(disp, &rotated_area);
-    /*Calculate the source stride (bytes in a line) from the width of the area*/
     uint32_t src_stride = lv_draw_buf_width_to_stride(lv_area_get_width(area), cf);
-    /*Calculate the stride of the destination (rotated) area too*/
     uint32_t dest_stride = lv_draw_buf_width_to_stride(lv_area_get_width(&rotated_area), cf);
-    /*Have a buffer to store the rotated area and perform the rotation*/
-    
+
     int32_t src_w = lv_area_get_width(area);
     int32_t src_h = lv_area_get_height(area);
     lv_draw_sw_rotate(color_p, lvgl_dest, src_w, src_h, src_stride, dest_stride, rotation, cf);
-    /*Use the rotated area and rotated buffer from now on*/
     area = &rotated_area;
   }
 
@@ -123,7 +118,6 @@ static void TouchInputReadCallback(lv_indev_t * indev, lv_indev_data_t *indevDat
   uint16_t pointY;
   pointX = (((uint16_t)buff[2] & 0x0f) << 8) | (uint16_t)buff[3];
   pointY = (((uint16_t)buff[4] & 0x0f) << 8) | (uint16_t)buff[5];
-  ESP_LOGI("Touch","%d,%d",buff[0],buff[1]);
   if (buff[1]>0 && buff[1]<5)
   {
     indevData->state = LV_INDEV_STATE_PRESSED;
@@ -257,12 +251,13 @@ void lvgl_port_init(void)
   assert(buffer_1);
   assert(buffer_2);
 	trans_buf_1 = (uint16_t *)heap_caps_malloc(LVGL_DMA_BUFF_LEN, MALLOC_CAP_DMA);
-	assert(trans_buf_1);
+  assert(trans_buf_1);
   lv_display_set_buffers(disp, buffer_1, buffer_2, BUFF_SIZE, LV_DISPLAY_RENDER_MODE_FULL);
   lv_display_set_user_data(disp, panel);
 #if (Rotated == USER_DISP_ROT_90)
-    lvgl_dest = (uint8_t *)heap_caps_malloc(BUFF_SIZE, MALLOC_CAP_SPIRAM); //旋转buf
-    lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_270);
+  lvgl_dest = (uint8_t *)heap_caps_malloc(BUFF_SIZE, MALLOC_CAP_SPIRAM);
+  assert(lvgl_dest);
+  lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_270);
 #endif
   /*port indev*/
   lv_indev_t *touch_indev = NULL;

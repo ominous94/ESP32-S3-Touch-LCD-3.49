@@ -130,6 +130,19 @@ ttf_font_20 = lv_tiny_ttf_create_file_ex(CODEX_STATUS_FONT_PATH, 20, LV_FONT_KER
 - The display shows at most 5 sessions.
 - The default Arduino board configuration for `esp32:esp32:esp32s3` still does not fit this sketch. Use the documented `16M` / `app3M_fat9M_16MB` compile profile or the provided compile launcher.
 
+## LVGL Scroll Performance Notes
+
+- 右侧子卡片滑动的低帧率根因不只是 UI 对象数量，而是当前显示链路仍然是全屏刷新：`172 x 640 x RGB565` 每帧约 220KB，还要执行软件旋转、`lv_draw_sw_rgb565_swap()`、PSRAM 到 DMA buffer 拷贝和 QSPI 传输。
+- 2026-06-15 实测 AXS15231B 面板硬件旋转会花屏：`esp_lcd_panel_swap_xy(panel, true)` + `esp_lcd_panel_mirror(panel, false, true)` 并让 LVGL 直接写 `640 x 172` 时，屏幕显示被切成多份条纹。根因是当前 QSPI `draw_bitmap()` 写入链路仍依赖 `172 x 640` 物理连续窗口，不能直接换成横屏窗口。
+- 已验证安全优化：`Examples/Arduino/12_Codex_Status/lvgl_port.c` 中触摸读取热路径不要保留 `ESP_LOGI("Touch", ...)`。`LV_DEF_REFR_PERIOD=16` 在实机上可能出现周期性竖线，默认保持 `33`。
+- 不要直接把本项目改成 `LV_DISPLAY_RENDER_MODE_PARTIAL` 或任意矩形局部刷新。2026-06-14 已实测会导致开发板花屏。
+- 花屏根因：当前 `src/axs15231b/esp_lcd_axs15231b.c` 的 QSPI 分支在 `panel_axs15231b_draw_bitmap()` 中只设置 `CASET`，`use_qspi_interface` 时不会设置 `RASET`；原始实现依赖从 `y=0` 开始的全屏连续 `RAMWR`/`RAMWRC` 写入。任意局部区域写入会把面板显存地址推进关系打乱。
+- 当前测试 `tests/test_codex_status_scroll_performance.py` 明确约束 QSPI + 软件旋转下保持 `LV_DISPLAY_RENDER_MODE_FULL`，避免再次引入硬件旋转花屏或 partial 花屏。
+- 后续若要真正提升跟手滑动帧率，有两条路线：
+  1. 修 AXS15231B QSPI 局部刷新驱动，确认 QSPI 模式下正确设置行地址/窗口后，再启用 LVGL partial render。
+  2. 不做连续跟手滚动，改成分页/吸附滚动，减少全屏连续刷新次数，稳定性最高。
+- 详细坑点已记录到 Obsidian：`F:\CodexProject\CodexVault\ESP32-S3-Touch-LCD-3.49\LVGL AXS15231B QSPI局部刷新花屏与低帧率.md`。
+
 ## Next Optimization Directions
 
 - Improve the live session pipeline.

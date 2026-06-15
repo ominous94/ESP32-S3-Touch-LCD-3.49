@@ -46,12 +46,12 @@
 
 #define USER_DISP_ROT_90    1
 #define USER_DISP_ROT_NONO  0
-#define Rotated USER_DISP_ROT_90   //软件实现旋转
+#define Rotated USER_DISP_ROT_90
 
 
 
 
-#define EXAMPLE_LCD_H_RES 172   
+#define EXAMPLE_LCD_H_RES 172
 #define EXAMPLE_LCD_V_RES 640
 
 
