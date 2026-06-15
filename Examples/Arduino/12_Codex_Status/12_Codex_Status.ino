@@ -13,6 +13,7 @@
 #include <HTTPClient.h>
 #include <WiFi.h>
 #include <lvgl.h>
+#include "adc_bsp.h"
 
 #define CODEX_STATUS_ENABLE_SD_TTF 1
 
@@ -37,10 +38,13 @@ const char *WIFI_PASSWORD = "ziroom0503";
 const char *STATUS_URL = "http://192.168.31.222:8787/status";
 
 static const uint32_t STATUS_POLL_INTERVAL_MS = 3000;
+static const uint32_t BATTERY_POLL_INTERVAL_MS = 1000;
+static const float BATTERY_VOLTAGE_MAX = 4.2f;
+static const float BATTERY_VOLTAGE_MIN = 3.0f;
 static const int SESSION_DRAG_CANCEL_PX = 12;
 static const int MAX_SESSIONS = 5;
-static const int VISIBLE_SESSIONS = 5;
-static const int SECONDARY_SESSIONS = 4;
+static const int VISIBLE_SESSIONS = 3;
+static const int SECONDARY_SESSIONS = 2;
 static const int COMPANION_PANEL_W = 150;
 static const int PRIMARY_PANEL_W = 318;
 static const int SECONDARY_PANEL_W = 148;
@@ -50,8 +54,7 @@ static const int COMPANION_IMAGE_H = 56;
 static const int PRIMARY_TITLE_W = 286;
 static const int PRIMARY_TEXT_W = 300;
 static const int SECONDARY_TITLE_W = 124;
-static const int SECONDARY_CARD_H = 52;
-static const int PROGRESS_BAR_W = 286;
+static const int SECONDARY_CARD_H = 76;
 static const int DETAIL_BACK_PANEL_W = 86;
 static const int DETAIL_CONTENT_W = 530;
 static const char *CODEX_STATUS_FONT_PATH = "S:/fonts/NotoSansSC-VF.ttf";
@@ -59,6 +62,7 @@ static const gpio_num_t SDCARD_D0_PIN = GPIO_NUM_40;
 static const gpio_num_t SDCARD_CLK_PIN = GPIO_NUM_41;
 static const gpio_num_t SDCARD_CMD_PIN = GPIO_NUM_39;
 static uint32_t last_status_poll_ms = 0;
+static uint32_t last_battery_poll_ms = 0;
 static bool is_power_hold_enabled = false;
 static bool is_sd_card_mounted = false;
 static esp_io_expander_handle_t io_expander = NULL;
@@ -68,13 +72,16 @@ static lv_font_t *ttf_font_20 = NULL;
 
 static lv_obj_t *connection_label = NULL;
 static lv_obj_t *assistant_image = NULL;
+static lv_obj_t *battery_pct_label = NULL;
+static lv_obj_t *battery_fill = NULL;
+static lv_obj_t *battery_body = NULL;
+static lv_obj_t *battery_terminal = NULL;
+static lv_obj_t *bolt_line = NULL;
 static lv_obj_t *companion_state_label = NULL;
-static lv_obj_t *companion_summary_label = NULL;
 static lv_obj_t *primary_status_dot = NULL;
 static lv_obj_t *primary_status_label = NULL;
 static lv_obj_t *primary_title_label = NULL;
 static lv_obj_t *primary_meta_label = NULL;
-static lv_obj_t *primary_progress_bar = NULL;
 static lv_obj_t *secondary_cards[SECONDARY_SESSIONS] = {};
 static lv_obj_t *secondary_dots[SECONDARY_SESSIONS] = {};
 static lv_obj_t *secondary_statuses[SECONDARY_SESSIONS] = {};
@@ -90,10 +97,11 @@ enum CodexPage {
 static CodexPage current_page = CODEX_PAGE_HOME;
 static String latest_connection;
 static int selected_session_index = -1;
-static int visible_session_indices[VISIBLE_SESSIONS] = {-1, -1, -1, -1, -1};
-static bool session_press_cancelled[VISIBLE_SESSIONS] = {false, false, false, false, false};
+static int visible_session_indices[VISIBLE_SESSIONS] = {-1, -1, -1};
+static bool session_press_cancelled[VISIBLE_SESSIONS] = {false, false, false};
 static lv_point_t session_press_start[VISIBLE_SESSIONS] = {};
 static bool back_press_cancelled = false;
+static int pending_viewed_session = -1;
 
 struct CodexSession {
   String id;
@@ -392,15 +400,6 @@ static String status_label_text(const CodexSession &session)
   return "未知";
 }
 
-static int state_progress_width(const String &state)
-{
-  if (state == "complete") return PROGRESS_BAR_W;
-  if (state == "active") return 186;
-  if (state == "notLoaded") return 100;
-  if (state == "blocked") return 58;
-  return 32;
-}
-
 static lv_color_t state_color(const String &state)
 {
   if (state == "active") return lv_color_hex(0x78F0A4);
@@ -631,9 +630,9 @@ static void mark_session_viewed(const CodexSession &session)
 static void open_session_detail(int session_index)
 {
   if (session_index < 0 || session_index >= latest_status.session_count) return;
-  mark_session_viewed(latest_status.sessions[session_index]);
   selected_session_index = session_index;
   current_page = CODEX_PAGE_DETAIL;
+  pending_viewed_session = session_index;
   Serial.print("CODEX_STATUS detail_open");
   log_serial_field("index", session_index);
   Serial.println();
@@ -644,6 +643,7 @@ static void return_to_home()
 {
   selected_session_index = -1;
   current_page = CODEX_PAGE_HOME;
+  pending_viewed_session = -1;
   log_serial_event("CODEX_STATUS detail_back");
   render_home_ui_locked();
   bind_home_status_locked(latest_connection.c_str(), latest_status);
@@ -692,20 +692,67 @@ static void render_home_ui_locked()
   lv_obj_set_flex_flow(companion_panel, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_flex_align(companion_panel, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
+  lv_obj_t *battery_row = lv_obj_create(companion_panel);
+  lv_obj_set_size(battery_row, 132, 24);
+  lv_obj_clear_flag(battery_row, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_style_bg_opa(battery_row, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(battery_row, 0, 0);
+  lv_obj_set_style_pad_all(battery_row, 0, 0);
+  lv_obj_set_style_pad_column(battery_row, 4, 0);
+  lv_obj_set_flex_flow(battery_row, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(battery_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+  lv_obj_t *battery_icon = lv_obj_create(battery_row);
+  lv_obj_set_size(battery_icon, 32, 16);
+  lv_obj_clear_flag(battery_icon, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_style_bg_opa(battery_icon, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(battery_icon, 0, 0);
+  lv_obj_set_style_pad_all(battery_icon, 0, 0);
+
+  battery_body = lv_obj_create(battery_icon);
+  lv_obj_set_size(battery_body, 28, 14);
+  lv_obj_set_pos(battery_body, 0, 1);
+  lv_obj_set_style_bg_opa(battery_body, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(battery_body, 1, 0);
+  lv_obj_set_style_border_color(battery_body, lv_color_hex(0xF7FAFC), 0);
+  lv_obj_set_style_radius(battery_body, 3, 0);
+  lv_obj_set_style_pad_all(battery_body, 2, 0);
+
+  battery_fill = lv_obj_create(battery_body);
+  lv_obj_set_size(battery_fill, 0, 10);
+  lv_obj_set_pos(battery_fill, 0, 0);
+  lv_obj_set_style_bg_color(battery_fill, lv_color_hex(0x78F0A4), 0);
+  lv_obj_set_style_border_width(battery_fill, 0, 0);
+  lv_obj_set_style_radius(battery_fill, 1, 0);
+
+  battery_terminal = lv_obj_create(battery_icon);
+  lv_obj_set_size(battery_terminal, 3, 6);
+  lv_obj_set_pos(battery_terminal, 28, 5);
+  lv_obj_set_style_bg_color(battery_terminal, lv_color_hex(0xF7FAFC), 0);
+  lv_obj_set_style_border_width(battery_terminal, 0, 0);
+  lv_obj_set_style_radius(battery_terminal, 1, 0);
+
+  bolt_line = lv_line_create(battery_icon);
+  static lv_point_precise_t bolt_pts[] = {{9, 4}, {5, 8}, {10, 8}, {7, 12}};
+  lv_line_set_points(bolt_line, bolt_pts, 4);
+  lv_obj_set_style_line_width(bolt_line, 2, 0);
+  lv_obj_set_style_line_color(bolt_line, lv_color_hex(0xF0C86F), 0);
+  lv_obj_set_style_line_rounded(bolt_line, true, 0);
+  lv_obj_add_flag(bolt_line, LV_OBJ_FLAG_HIDDEN);
+
+  battery_pct_label = create_label(battery_row, "--%", lv_color_hex(0xF7FAFC), 56, codex_font_20());
+
   assistant_image = lv_image_create(companion_panel);
   lv_image_set_src(assistant_image, &codex_img_idle);
   lv_image_set_scale(assistant_image, 82);
   lv_obj_set_size(assistant_image, COMPANION_IMAGE_W, COMPANION_IMAGE_H);
   lv_obj_align(assistant_image, LV_ALIGN_CENTER, 0, 0);
+  lv_obj_add_flag(assistant_image, LV_OBJ_FLAG_HIDDEN);
 
-  lv_obj_t *companion_title = create_label(companion_panel, "Codex 伙伴", lv_color_hex(0xF7FAFC), 132, codex_font_20());
-  lv_label_set_long_mode(companion_title, LV_LABEL_LONG_DOT);
   companion_state_label = create_label(companion_panel, "启动中", lv_color_hex(0x78F0A4), 132);
   lv_label_set_long_mode(companion_state_label, LV_LABEL_LONG_DOT);
   connection_label = create_label(companion_panel, "网络：启动中", lv_color_hex(0x8FB3C8), 132);
   lv_label_set_long_mode(connection_label, LV_LABEL_LONG_DOT);
-  companion_summary_label = create_label(companion_panel, "会话：-- · 3秒刷新", lv_color_hex(0xC6D1D8), 132);
-  lv_label_set_long_mode(companion_summary_label, LV_LABEL_LONG_DOT);
 
   lv_obj_t *primary_panel = lv_obj_create(screen);
   lv_obj_set_size(primary_panel, PRIMARY_PANEL_W, PANEL_H);
@@ -753,29 +800,9 @@ static void render_home_ui_locked()
   lv_obj_set_height(primary_meta_label, 18);
   lv_label_set_long_mode(primary_meta_label, LV_LABEL_LONG_DOT);
 
-  lv_obj_t *progress_track = lv_obj_create(primary_panel);
-  make_touch_event_bubble(progress_track);
-  lv_obj_set_size(progress_track, PROGRESS_BAR_W, 7);
-  lv_obj_clear_flag(progress_track, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_set_style_bg_color(progress_track, lv_color_hex(0x2B3640), 0);
-  lv_obj_set_style_border_width(progress_track, 0, 0);
-  lv_obj_set_style_radius(progress_track, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_pad_all(progress_track, 0, 0);
-
-  primary_progress_bar = lv_obj_create(progress_track);
-  make_touch_event_bubble(primary_progress_bar);
-  lv_obj_set_size(primary_progress_bar, 32, 7);
-  lv_obj_clear_flag(primary_progress_bar, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_set_style_bg_color(primary_progress_bar, lv_color_hex(0x78F0A4), 0);
-  lv_obj_set_style_border_width(primary_progress_bar, 0, 0);
-  lv_obj_set_style_radius(primary_progress_bar, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_pad_all(primary_progress_bar, 0, 0);
-  lv_obj_align(primary_progress_bar, LV_ALIGN_LEFT_MID, 0, 0);
-
   lv_obj_t *secondary_panel = lv_obj_create(screen);
   lv_obj_set_size(secondary_panel, SECONDARY_PANEL_W, PANEL_H);
-  lv_obj_add_flag(secondary_panel, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_set_scroll_dir(secondary_panel, LV_DIR_VER);
+  lv_obj_clear_flag(secondary_panel, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_set_style_bg_opa(secondary_panel, LV_OPA_TRANSP, 0);
   lv_obj_set_style_border_width(secondary_panel, 0, 0);
   lv_obj_set_style_pad_all(secondary_panel, 0, 0);
@@ -793,7 +820,7 @@ static void render_home_ui_locked()
     lv_obj_set_style_pad_all(secondary_cards[i], 6, 0);
     lv_obj_set_style_pad_row(secondary_cards[i], 5, 0);
     lv_obj_set_flex_flow(secondary_cards[i], LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(secondary_cards[i], LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_flex_align(secondary_cards[i], LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
     lv_obj_add_flag(secondary_cards[i], LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(secondary_cards[i], session_feedback_event_cb, LV_EVENT_ALL, (void *)(intptr_t)(i + 1));
     lv_obj_add_event_cb(secondary_cards[i], session_card_event_cb, LV_EVENT_RELEASED, (void *)(intptr_t)(i + 1));
@@ -903,11 +930,6 @@ static void set_label_text(lv_obj_t *label, const String &text)
 static void bind_home_status_locked(const char *connection, const CodexStatus &status)
 {
   set_label_text(connection_label, String("网络：") + connection);
-  set_label_text(companion_summary_label, String("会话：") + status.session_count + "个 · 3秒刷新");
-
-  if (assistant_image != NULL) {
-    lv_image_set_src(assistant_image, image_for_status(connection, status));
-  }
 
   int order[VISIBLE_SESSIONS] = {};
   build_visible_session_order(status, order);
@@ -929,8 +951,6 @@ static void bind_home_status_locked(const char *connection, const CodexStatus &s
     lv_obj_set_style_bg_color(primary_status_dot, state_color(primary.state), 0);
     set_label_text(primary_title_label, title_text);
     set_label_text(primary_meta_label, project_text + " · " + updated_text);
-    lv_obj_set_width(primary_progress_bar, state_progress_width(primary.state));
-    lv_obj_set_style_bg_color(primary_progress_bar, state_color(primary.state), 0);
   } else {
     String empty_state = connection_is_error(connection) ? String(connection) : String("待机");
     set_label_text(companion_state_label, empty_state);
@@ -940,8 +960,6 @@ static void bind_home_status_locked(const char *connection, const CodexStatus &s
     lv_obj_set_style_bg_color(primary_status_dot, lv_color_hex(0xF0C86F), 0);
     set_label_text(primary_title_label, "暂无会话");
     set_label_text(primary_meta_label, status.updated_at.length() ? status.updated_at : "--");
-    lv_obj_set_width(primary_progress_bar, state_progress_width(""));
-    lv_obj_set_style_bg_color(primary_progress_bar, lv_color_hex(0x8FA1AD), 0);
   }
 
   for (int i = 0; i < SECONDARY_SESSIONS; ++i) {
@@ -1059,6 +1077,51 @@ static void poll_status()
   http.end();
 }
 
+static int voltage_to_percent(float v)
+{
+  if (v <= BATTERY_VOLTAGE_MIN) return 0;
+  if (v >= BATTERY_VOLTAGE_MAX) return 100;
+  return (int)((v - BATTERY_VOLTAGE_MIN) / (BATTERY_VOLTAGE_MAX - BATTERY_VOLTAGE_MIN) * 100.0f + 0.5f);
+}
+
+static lv_color_t percent_color(int pct)
+{
+  if (pct < 20) return lv_color_hex(0xFF7E7E);
+  if (pct < 60) return lv_color_hex(0xF0C86F);
+  return lv_color_hex(0x78F0A4);
+}
+
+static void poll_battery()
+{
+  if (battery_pct_label == NULL) return;
+  float volts = 0;
+  int raw = 0;
+  adc_get_value(&volts, &raw);
+  bool charging = gpio_get_level(GPIO_NUM_16) != 0;
+  int pct = voltage_to_percent(volts);
+  lv_color_t color = percent_color(pct);
+  int fill_w = pct * 24 / 100;
+  if (fill_w < 0) fill_w = 0;
+  if (fill_w > 24) fill_w = 24;
+
+  if (lvgl_port_lock(-1)) {
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%d%%", pct);
+    lv_label_set_text(battery_pct_label, buf);
+    lv_obj_set_style_text_color(battery_pct_label, color, 0);
+    lv_obj_set_width(battery_fill, fill_w);
+    lv_obj_set_style_bg_color(battery_fill, color, 0);
+    lv_obj_set_style_border_color(battery_body, color, 0);
+    lv_obj_set_style_bg_color(battery_terminal, color, 0);
+    if (charging) {
+      lv_obj_clear_flag(bolt_line, LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_obj_add_flag(bolt_line, LV_OBJ_FLAG_HIDDEN);
+    }
+    lvgl_port_unlock();
+  }
+}
+
 void setup()
 {
   Serial.begin(115200);
@@ -1072,6 +1135,8 @@ void setup()
   init_sd_card();
   init_ttf_fonts();
   lcd_bl_pwm_bsp_init(LCD_PWM_MODE_255);
+  adc_bsp_init();
+  gpio_set_direction(GPIO_NUM_16, GPIO_MODE_INPUT);
 
   create_status_ui();
   button_Init();
@@ -1080,12 +1145,28 @@ void setup()
   poll_status();
 }
 
+static void flush_pending_viewed()
+{
+  int idx = pending_viewed_session;
+  if (idx < 0) return;
+  pending_viewed_session = -1;
+  if (idx < latest_status.session_count && WiFi.status() == WL_CONNECTED) {
+    mark_session_viewed(latest_status.sessions[idx]);
+  }
+}
+
 void loop()
 {
+  flush_pending_viewed();
+
   uint32_t now_ms = millis();
   if (now_ms - last_status_poll_ms >= STATUS_POLL_INTERVAL_MS) {
     last_status_poll_ms = now_ms;
     poll_status();
+  }
+  if (now_ms - last_battery_poll_ms >= BATTERY_POLL_INTERVAL_MS) {
+    last_battery_poll_ms = now_ms;
+    poll_battery();
   }
 
   delay(50);
