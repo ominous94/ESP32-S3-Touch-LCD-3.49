@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+.superpowers/
+.npm-cache/
+logs/
+
+# Arduino build cache
+.arduino-build/
+
+# Local code-graph index / daemon
+.codegraph/
+
+# Reasonix tool local cache and config
+.reasonix/
+reasonix.toml
+
+# Runtime data captured by the Codex Status bridge / exporter
+sessions.json
+sessions_check.json
+viewed_sessions.json
+
+# One-off error log dumps
+ErrorLog.txt
