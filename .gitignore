@@ -21,3 +21,7 @@ viewed_sessions.json
 
 # One-off error log dumps
 ErrorLog.txt
+
+# Claude Code local files
+.claude/
+.context/
