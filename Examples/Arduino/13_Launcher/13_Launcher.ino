@@ -116,6 +116,11 @@ static void tca9554_init(void)
   i2c_master_bus_handle_t tca9554_i2c_bus = NULL;
   ESP_ERROR_CHECK(i2c_master_get_bus_handle(0, &tca9554_i2c_bus));
   ESP_ERROR_CHECK(esp_io_expander_new_i2c_tca9554(tca9554_i2c_bus, ESP_IO_EXPANDER_I2C_TCA9554_ADDRESS_000, &io_expander));
+
+  // V2 板需要同时打开 EXIO1，GPIO42 上的 PWM 才能驱动背光。
+  ESP_ERROR_CHECK(esp_io_expander_set_dir(io_expander, EXAMPLE_EXIO_PIN_BL_EN, IO_EXPANDER_OUTPUT));
+  ESP_ERROR_CHECK(esp_io_expander_set_level(io_expander, EXAMPLE_EXIO_PIN_BL_EN, 1));
+
   ESP_ERROR_CHECK(esp_io_expander_set_dir(io_expander, IO_EXPANDER_PIN_NUM_6, IO_EXPANDER_OUTPUT));
   ESP_ERROR_CHECK(esp_io_expander_set_level(io_expander, IO_EXPANDER_PIN_NUM_6, 1));
   is_power_hold_enabled = true;
@@ -123,6 +128,7 @@ static void tca9554_init(void)
   // Pin 7 = ES8311 功放使能 (PA Enable)，拉高开启扬声器功放
   ESP_ERROR_CHECK(esp_io_expander_set_dir(io_expander, IO_EXPANDER_PIN_NUM_7, IO_EXPANDER_OUTPUT));
   ESP_ERROR_CHECK(esp_io_expander_set_level(io_expander, IO_EXPANDER_PIN_NUM_7, 1));
+  Serial.println("LAUNCHER backlight_enable exio1=high pwm_gpio=42");
   Serial.println("LAUNCHER pa_enabled pin7=high");
 }
 

@@ -4,12 +4,11 @@
 #include "core/lv_obj_event_private.h"
 #include <Preferences.h>
 
-extern "C" { void setUpduty(uint16_t duty); }
-
 static Preferences s_prefs;
 static const char *kPrefNamespace = "launcher";
 static const char *kKeyBrightness = "brightness";
 static const char *kKeyVolume = "volume";
+static const int kMinBrightness = 128;  // 约 50%，限制滑条的最低亮度
 static const int kDefaultBrightness = 255;
 static const int kDefaultVolume = 50;
 
@@ -33,7 +32,7 @@ void settings_load(void) {
   g_brightness = s_prefs.getInt(kKeyBrightness, kDefaultBrightness);
   g_volume = s_prefs.getInt(kKeyVolume, kDefaultVolume);
   s_prefs.end();
-  if (g_brightness < 1) g_brightness = 1;
+  if (g_brightness < kMinBrightness) g_brightness = kMinBrightness;
   if (g_brightness > 255) g_brightness = 255;
   if (g_volume < 0) g_volume = 0;
   if (g_volume > 100) g_volume = 100;
@@ -74,7 +73,6 @@ static void brightness_changed_cb(lv_event_t *e) {
 
   /* Always update backlight immediately for real-time response */
   setUpduty(duty);
-  Serial.printf("BL val=%d duty=%d\n", val, duty);
 
   /* Only update label when displayed percentage actually changes */
   int pct = val * 100 / 255;
@@ -202,13 +200,12 @@ lv_obj_t *app_settings_create(void) {
   lv_obj_set_style_text_font(title, codex_font_20(), 0);
   lv_obj_set_style_text_color(title, lv_color_hex(0xF7FAFC), 0);
 
-  /* Brightness row — disabled (backlight PWM not functional on V2 board)
-  brightness_slider = build_setting_row(g_scr, "亮度", 1, 255, g_brightness,
+  /* Brightness row */
+  brightness_slider = build_setting_row(g_scr, "亮度", kMinBrightness, 255, g_brightness,
                                           lv_color_hex(0x78F0A4),
                                           &brightness_label,
                                           brightness_changed_cb);
   lv_obj_add_event_cb(brightness_slider, brightness_released_cb, LV_EVENT_RELEASED, NULL);
-  */
 
   /* Volume row */
   volume_slider = build_setting_row(g_scr, "音量", 0, 100, g_volume,

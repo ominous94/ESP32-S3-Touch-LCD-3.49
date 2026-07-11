@@ -30,23 +30,11 @@
 
 ## 已知问题
 
-### 背光滑条不生效 [未解决]
-- 13_Launcher 设置页的亮度滑条拖动流畅，值已持久化到 NVS，但**背光亮度实际不会变化**
-- 已尝试的方法均无效：
-  - LEDC PWM 控制 GPIO 8 → 无效
-  - TCA9554 Pin 7 直接 toggle 高/低 → 无效
-  - AW9364 脉冲控制 TCA9554 Pin 7 → 无效（拉高/拉低/发送脉冲序列均无响应）
-- TCA9554 本身正常（Pin 6 电源保持功能工作正常）
-- 可能原因：
-  - V2 硬件变更了背光控制方式，Pin 7 可能不再控制背光
-  - 背光可能连接在 TCA9554 的其他引脚（Pin 0-5）或 ESP32 的其他 GPIO
-  - 背光可能由未发现的 I2C 芯片控制
-- 下一步排查方向：
-  - I2C 总线扫描，寻找未知设备
-  - TCA9554 Pin 0-5 逐个 toggle 测试
-  - GPIO 8 直接 `gpio_set_level()` toggle（非 LEDC PWM）
-  - 查阅 V2 版本原理图
-- 详细排查记录见 memory: [[backlight-fix-attempts]]
+### 背光滑条不生效 [已修复]
+- 根因：13_Launcher 沿用了 V1 引脚表。V2 板的背光 PWM 已从 GPIO 8 改到 GPIO 42，并增加 TCA9554 EXIO1 作为背光总使能。
+- 修复：`user_config.h` 使用 GPIO 42；初始化 TCA9554 时拉高 EXIO1；设置页恢复亮度滑条。
+- 亮度值范围限制为 128~255（约 50%~100%）；拖动时实时更新 PWM，释放时保存到 NVS，重启后自动恢复。
+- GPIO 42 的 PWM 为低有效，转换保持 `duty = 255 - brightness`。
 
 ### AXS15231B QSPI 屏幕限制
 - 不支持局部刷新，LVGL 必须用 FULL 渲染模式
