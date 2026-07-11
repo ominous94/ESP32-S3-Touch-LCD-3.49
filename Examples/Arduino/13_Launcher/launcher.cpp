@@ -4,8 +4,8 @@ static lv_obj_t *g_launcher_scr = NULL;
 static lv_obj_t *g_current_app_scr = NULL;
 static int g_current_app_index = -1;
 static const LauncherApp *g_current_app = NULL;
-static int pending_app_switch = -1;
-static bool pending_return_home = false;
+static volatile int pending_app_switch = -1;
+static volatile bool pending_return_home = false;
 
 static lv_obj_t *g_bat_pct_label = NULL;
 static lv_obj_t *g_wifi_label = NULL;
@@ -209,6 +209,9 @@ void launcher_return_to_home(void)
   // 只等待 500ms，而不是无限等待
   if (!lvgl_port_lock(500)) {
     Serial.println("LAUNCHER app_close lock timeout!");
+    // 返回请求来自 LVGL 事件任务，而页面切换在 Arduino loop 中执行。
+    // 锁暂时繁忙时保留请求，避免用户必须再次点击。
+    pending_return_home = true;
     return;
   }
 

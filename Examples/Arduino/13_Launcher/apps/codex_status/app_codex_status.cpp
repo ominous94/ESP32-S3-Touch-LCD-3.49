@@ -33,7 +33,7 @@ static const int SECONDARY_TITLE_W = 124;
 static const int SECONDARY_CARD_H = 76;
 
 /* ========== State ========== */
-static lv_obj_t *g_app_scr = NULL;
+static lv_obj_t * volatile g_app_scr = NULL;
 
 static lv_obj_t *connection_label = NULL;
 static lv_obj_t *assistant_image = NULL;
@@ -109,7 +109,6 @@ static int g_prev_session_count = 0;
 static TaskHandle_t g_poll_task_handle = NULL;
 static SemaphoreHandle_t g_poll_mutex = NULL;
 static volatile bool g_poll_dirty = false;
-static volatile bool g_poll_task_should_exit = false;  // 优雅退出标志
 static CodexStatus g_polled_status;
 static String g_polled_connection;
 
@@ -510,13 +509,8 @@ static void session_feedback_event_cb(lv_event_t *event) {
 static void codex_poll_task_func(void *arg) {
   uint32_t last_poll_ms = 0;
   for (;;) {
-    // 检查退出标志
-    if (g_poll_task_should_exit) {
-      Serial.println("CODEX_STATUS poll_task exiting");
-      break;
-    }
-
-    // 如果 app 已经关闭，直接等待退出
+    // 轮询任务随 Launcher 常驻；Codex 页面关闭时暂停网络访问。
+    // 这样返回主屏不需要等待正在进行的 HTTP 请求超时。
     if (g_app_scr == NULL) {
       vTaskDelay(pdMS_TO_TICKS(100));
       continue;
@@ -529,9 +523,6 @@ static void codex_poll_task_func(void *arg) {
       continue;
     }
     last_poll_ms = now;
-
-    // 再次检查退出标志
-    if (g_poll_task_should_exit) break;
 
     /* Poll status */
     CodexStatus status;
@@ -567,9 +558,6 @@ static void codex_poll_task_func(void *arg) {
       http.end();
     }
 
-    // 再次检查退出标志
-    if (g_poll_task_should_exit) break;
-
     /* Store results for main thread */
     if (xSemaphoreTake(g_poll_mutex, pdMS_TO_TICKS(50))) {  // 缩短锁等待时间
       g_polled_status = status;
@@ -578,11 +566,6 @@ static void codex_poll_task_func(void *arg) {
       xSemaphoreGive(g_poll_mutex);
     }
   }
-
-  // 退出前清理
-  Serial.println("CODEX_STATUS poll_task exited");
-  g_poll_task_handle = NULL;
-  vTaskDelete(NULL);  // 删除自己
 }
 
 /* ========== Navigation ========== */
@@ -929,20 +912,21 @@ lv_obj_t *app_codex_create(void) {
   lv_obj_clear_flag(g_app_scr, LV_OBJ_FLAG_SCROLLABLE);
   render_home_ui_locked();
 
-  g_poll_mutex = xSemaphoreCreateMutex();
   g_poll_dirty = false;
-  g_poll_task_should_exit = false;
+  if (g_poll_mutex == NULL) {
+    g_poll_mutex = xSemaphoreCreateMutex();
+  }
   if (g_poll_mutex == NULL) {
     Serial.println("CODEX_STATUS poll_mutex_create_failed");
     return g_app_scr;
   }
-  BaseType_t task_result = xTaskCreatePinnedToCore(
-      codex_poll_task_func, "codex_poll", 8192, NULL, 1, &g_poll_task_handle, 0);
-  if (task_result != pdPASS) {
-    Serial.println("CODEX_STATUS poll_task_create_failed");
-    vSemaphoreDelete(g_poll_mutex);
-    g_poll_mutex = NULL;
-    g_poll_task_handle = NULL;
+  if (g_poll_task_handle == NULL) {
+    BaseType_t task_result = xTaskCreatePinnedToCore(
+        codex_poll_task_func, "codex_poll", 8192, NULL, 1, &g_poll_task_handle, 0);
+    if (task_result != pdPASS) {
+      Serial.println("CODEX_STATUS poll_task_create_failed");
+      g_poll_task_handle = NULL;
+    }
   }
 
   return g_app_scr;
@@ -951,35 +935,11 @@ lv_obj_t *app_codex_create(void) {
 void app_codex_destroy(lv_obj_t *scr) {
   (void)scr;
 
-  // 1. 先设置 g_app_scr 为 NULL，告诉后台任务不要继续处理
+  // 先隐藏页面状态。轮询任务保持常驻并在页面关闭期间暂停，
+  // 避免在 LVGL 锁内等待 HTTP 超时，保证返回主屏立即响应。
   g_app_scr = NULL;
 
-  // 2. 通知后台任务优雅退出
-  if (g_poll_task_handle != NULL) {
-    g_poll_task_should_exit = true;
-
-    // 3. 等待时间覆盖 1500ms HTTP 超时，避免在网络栈调用中强制删除任务。
-    int wait_count = 0;
-    while (g_poll_task_handle != NULL && wait_count < 180) {
-      vTaskDelay(pdMS_TO_TICKS(10));
-      wait_count++;
-    }
-
-    // 4. 如果任务还没退出，才强制删除
-    if (g_poll_task_handle != NULL) {
-      Serial.println("CODEX_STATUS poll_task force delete");
-      vTaskDelete(g_poll_task_handle);
-      g_poll_task_handle = NULL;
-    }
-  }
-
-  // 5. 删除互斥锁
-  if (g_poll_mutex != NULL) {
-    vSemaphoreDelete(g_poll_mutex);
-    g_poll_mutex = NULL;
-  }
-
-  // 6. 清空所有 widget 指针
+  // 清空所有 widget 指针；后台任务不会访问这些指针。
   invalidate_card_flash();
   primary_card = NULL;
   connection_label = NULL; assistant_image = NULL; companion_state_label = NULL;
@@ -991,7 +951,6 @@ void app_codex_destroy(lv_obj_t *scr) {
     secondary_metas[i] = NULL;
   }
   g_poll_dirty = false;
-  g_poll_task_should_exit = false;
   g_prev_session_count = 0;
   g_sound_btn = NULL;
 }
