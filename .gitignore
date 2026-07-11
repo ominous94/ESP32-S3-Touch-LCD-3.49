@@ -4,6 +4,14 @@ __pycache__/
 .npm-cache/
 logs/
 
+# Python/PyInstaller build and packaging artifacts
+build/
+dist/
+*.spec
+
+# Accidental local temporary directory
+%TEMP%/
+
 # Arduino build cache
 .arduino-build/
 

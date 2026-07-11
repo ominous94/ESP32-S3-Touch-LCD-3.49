@@ -91,6 +91,22 @@ verify_codex_status.cmd --skip-compile --skip-upload
 - For this board, successful serial verification normally shows `CODEX_STATUS boot`, `CODEX_STATUS wifi_connected`, `CODEX_STATUS http_ok`, `CODEX_STATUS ui_update`, and one or more `CODEX_STATUS session` lines.
 - Do not claim a firmware change is verified unless the relevant command has passed in the current session and the serial log confirms the expected `CODEX_STATUS` events.
 
+## 13_Launcher Build/Deploy Workflow
+
+- 编译/烧录/验证 `Examples/Arduino/13_Launcher` 时，**直接调用根目录的三个一键脚本，不要手动拼 `arduino-cli` 命令**。FQBN、LVGL9 库路径、ESP32 USB 端口自动检测都已固化在脚本里，手拼命令容易漏 `CDCOnBoot=cdc` 或 `PSRAM=opi` 导致串口无输出或 PSRAM 断言。
+
+| 场景 | 命令 | 行为 |
+|------|------|------|
+| 只编译 | `compile_13_launcher.cmd` | LVGL9/16M/CDC/OPI 增量编译，产物落 `.arduino-build\13-launcher-16m-lvgl9-cdc-opi` |
+| 编译+烧录 | `upload_13_launcher.cmd` | build 不存在时先编译，再上传到自动检测的 ESP32 USB 串口；可用 `-Port COMx` 显式指定端口 |
+| 编译+烧录+串口确认 | `verify_13_launcher.cmd` | 每次重新编译+上传+抓串口，断言 `LAUNCHER boot`/`LAUNCHER ready`，禁止 `assert failed`/`Backtrace`/`Rebooting`/`RTC_SW_CPU_RST` |
+
+- 改完 13_Launcher 代码后的推荐入口是 `verify_13_launcher.cmd`——它每次都重新编译，最稳妥。若只想快速烧录已有 build，先确认代码没改动再跑 `upload_13_launcher.cmd`，因为 `tools/upload_13_launcher.ps1` 在 build 已存在时**不会**重新编译，会直接烧旧固件。
+- 三个脚本共用同一套 FQBN：`esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,CDCOnBoot=cdc,PSRAM=opi`，库路径固定为 `Arduino_Libraries\lvgl9\lvgl`，不要切到 lvgl8（原因见 Compile Lessons）。
+- 端口自动检测：脚本通过 `arduino-cli board list --format json` 找 ESP32 USB 串口（matching_boards 命中 `esp32:*` 或 VID `0x303a`）。本环境实测稳定在 `COM9`；检测不到时用 `powershell -File tools\upload_13_launcher.ps1 -Port COMx` 或 `verify_13_launcher.cmd --port COMx` 显式指定。
+- 串口日志输出到 `logs\launcher_serial_<时间戳>.log`，断言失败时读完整日志定位，不要只看最后一行。
+- `tools/upload_13_launcher.ps1` 里的 `Get-Esp32Port`/`Get-Port` 是死代码（从未被调用），实际端口检测走 `board list --format json`，不影响运行，不要因为看到未定义的 `Get-Port` 就去改。
+
 ## Session State Detection
 
 - 会话"工作中/未加载"的判定在 `tools/export_codex_sessions.py` 的 `_is_active_entry`，**不要**回退到旧的"看 cwd 是否在 `active-workspace-roots` 里"逻辑——那是 Codex Desktop 的"打开的工作区"列表，不代表里面的会话还在跑，会把所有历史会话错标为 active。
