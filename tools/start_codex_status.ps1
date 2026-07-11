@@ -2,10 +2,9 @@
     [string]$HostAddress = "0.0.0.0",
     [int]$Port = 8787,
     [string]$SessionsFile = "",
-    [string]$ViewedFile = "",
     [string]$CodexHome = "",
     [int]$Limit = 5,
-    [double]$Interval = 1.0,
+    [double]$Interval = 5.0,
     [switch]$DryRun
 )
 
@@ -15,9 +14,6 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $projectRoot = Split-Path -Parent $scriptDir
 if (-not $SessionsFile) {
     $SessionsFile = Join-Path $projectRoot "sessions.json"
-}
-if (-not $ViewedFile) {
-    $ViewedFile = Join-Path $projectRoot "viewed_sessions.json"
 }
 
 $logsDir = Join-Path $projectRoot "logs"
@@ -122,9 +118,9 @@ $exporterArgs = @(
     "tools\export_codex_sessions.py",
     "--output", $SessionsFile,
     "--limit", [string]$Limit,
-    "--viewed-file", $ViewedFile,
     "--watch",
-    "--interval", [string]$Interval
+    "--interval", [string]$Interval,
+    "--log-every", "60"
 )
 if ($CodexHome) {
     $exporterArgs += @("--codex-home", $CodexHome)
@@ -134,13 +130,11 @@ $bridgeArgs = @(
     "tools\codex_status_bridge.py",
     "--host", $HostAddress,
     "--port", [string]$Port,
-    "--sessions-file", $SessionsFile,
-    "--viewed-file", $ViewedFile
+    "--sessions-file", $SessionsFile
 )
 
 Write-Host "Starting Codex Status services from $projectRoot"
 Write-Host "Sessions file: $SessionsFile"
-Write-Host "Viewed file: $ViewedFile"
 Write-Host "Logs: $logsDir"
 Write-Host ""
 

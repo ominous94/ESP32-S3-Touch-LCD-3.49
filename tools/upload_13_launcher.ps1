@@ -54,15 +54,35 @@ if (-not (Test-Path -LiteralPath $lvglLibrary)) {
 if (-not $Port) {
     Write-Host "Scanning for ports..."
     $portList = & $arduinoCliPath board list --format json | ConvertFrom-Json
-    if ($portList -and $portList.Count -gt 0) {
-        $espPort = $portList | Where-Object { $_.matching_boards -and $_.matching_boards.fqbn -like "*esp32*" } | Select-Object -First 1
-        if ($espPort) {
-            $Port = $espPort.port.address
+    $entries = @()
+    if ($portList -and $portList.detected_ports) {
+        $entries = @($portList.detected_ports)
+    }
+    # 1) prefer a port whose matching_boards hits an esp32:* fqbn
+    foreach ($entry in $entries) {
+        $boards = @($entry.matching_boards)
+        $hit = $false
+        foreach ($b in $boards) {
+            if ($b -and $b.fqbn -and $b.fqbn -like "*esp32*") { $hit = $true; break }
+        }
+        if ($hit -and $entry.port -and $entry.port.address) {
+            $Port = $entry.port.address
             Write-Host "Found ESP32 board at: $Port"
-        } else {
-            # Just take the first port if no matching board
-            $Port = $portList[0].port.address
-            Write-Host "Using port: $Port"
+            break
+        }
+    }
+    # 2) fall back to a USB port with Espressif VID 0x303a
+    if (-not $Port) {
+        foreach ($entry in $entries) {
+            $vid = $null
+            if ($entry.port -and $entry.port.properties -and $entry.port.properties.vid) {
+                $vid = "$($entry.port.properties.vid)"
+            }
+            if ($vid -and $vid.ToLower() -eq "0x303a" -and $entry.port.address) {
+                $Port = $entry.port.address
+                Write-Host "Using ESP32 USB port (VID 0x303a): $Port"
+                break
+            }
         }
     }
 }

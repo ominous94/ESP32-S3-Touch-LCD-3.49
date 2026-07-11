@@ -1,6 +1,11 @@
 #include "app_codex_status.h"
-#include "adc_bsp.h"
+#include "apps/wifi_config/app_wifi_config.h"
+#include "src/audio_bsp/audio_bsp.h"
 #include <string.h>
+#include <math.h>
+#include <time.h>
+#include <sys/time.h>
+#include <Preferences.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
@@ -12,9 +17,6 @@ static const char *STATUS_URL = "http://192.168.31.222:8787/status";
 
 /* ========== Constants ========== */
 static const uint32_t STATUS_POLL_INTERVAL_MS = 3000;
-static const uint32_t BATTERY_POLL_INTERVAL_MS = 1000;
-static const float BATTERY_VOLTAGE_MAX = 4.2f;
-static const float BATTERY_VOLTAGE_MIN = 3.0f;
 static const int SESSION_DRAG_CANCEL_PX = 12;
 static const int MAX_SESSIONS = 5;
 static const int VISIBLE_SESSIONS = 3;
@@ -29,20 +31,12 @@ static const int PRIMARY_TITLE_W = 286;
 static const int PRIMARY_TEXT_W = 300;
 static const int SECONDARY_TITLE_W = 124;
 static const int SECONDARY_CARD_H = 76;
-static const int DETAIL_BACK_PANEL_W = 86;
-static const int DETAIL_CONTENT_W = 530;
 
 /* ========== State ========== */
 static lv_obj_t *g_app_scr = NULL;
-static uint32_t last_battery_poll_ms = 0;
 
 static lv_obj_t *connection_label = NULL;
 static lv_obj_t *assistant_image = NULL;
-static lv_obj_t *battery_pct_label = NULL;
-static lv_obj_t *battery_fill = NULL;
-static lv_obj_t *battery_body = NULL;
-static lv_obj_t *battery_terminal = NULL;
-static lv_obj_t *bolt_line = NULL;
 static lv_obj_t *companion_state_label = NULL;
 static lv_obj_t *primary_status_dot = NULL;
 static lv_obj_t *primary_status_label = NULL;
@@ -52,17 +46,18 @@ static lv_obj_t *secondary_cards[2] = {};
 static lv_obj_t *secondary_dots[2] = {};
 static lv_obj_t *secondary_statuses[2] = {};
 static lv_obj_t *secondary_titles[2] = {};
-static lv_obj_t *detail_back_button = NULL;
-static lv_obj_t *detail_content_label = NULL;
+static lv_obj_t *secondary_metas[2] = {};
 
-enum CodexPage { CODEX_PAGE_HOME, CODEX_PAGE_DETAIL };
-static CodexPage current_page = CODEX_PAGE_HOME;
 static String latest_connection;
-static int selected_session_index = -1;
 static int visible_session_indices[3] = {-1, -1, -1};
 static bool session_press_cancelled[3] = {};
 static lv_point_t session_press_start[3] = {};
-static bool back_press_cancelled = false;
+
+/* Sound toggle state */
+static bool g_sound_enabled = true;
+static lv_obj_t *g_sound_btn = NULL;
+static const char *CODEX_SOUND_PREF_NS = "codex_sound";
+static const char *CODEX_SOUND_PREF_KEY = "enabled";
 
 struct CodexSession {
   String id;
@@ -71,7 +66,8 @@ struct CodexSession {
   String status_zh;
   String cwd;
   String updated_at;
-  String detail;
+  String completed_at;
+  String last_user_at;
 };
 
 struct CodexStatus {
@@ -82,6 +78,29 @@ struct CodexStatus {
 
 static CodexStatus latest_status;
 static bool g_wifi_connected = false;
+static uint32_t last_runtime_refresh_ms = 0;
+static const uint32_t RUNTIME_REFRESH_INTERVAL_MS = 1000;
+
+/* Completion flash state — highlights a card for 3s when its session
+ * transitions into the "complete" state. Slot 0 = primary card, slots 1/2 =
+ * the two secondary cards. */
+static lv_obj_t *primary_card = NULL;
+struct CardFlashState {
+  lv_obj_t *card;
+  bool is_primary;
+  uint32_t start_ms;
+  bool active;
+};
+static CardFlashState g_card_flash[3] = {};
+static const uint32_t CARD_FLASH_DURATION_MS = 3000;
+static const uint32_t CARD_FLASH_BREATH_PERIOD_MS = 1000;  // one inhale+exhale cycle
+static const float CARD_FLASH_PEAK_RATIO = 0.2f;           // peak highlight blend (1/5 of full)
+
+/* Previous snapshot of session (id, state) used to detect the
+ * non-complete -> complete transition. */
+static String g_prev_session_ids[5];
+static String g_prev_session_states[5];
+static int g_prev_session_count = 0;
 
 /* Background poll task state */
 static TaskHandle_t g_poll_task_handle = NULL;
@@ -90,8 +109,6 @@ static volatile bool g_poll_dirty = false;
 static volatile bool g_poll_task_should_exit = false;  // 优雅退出标志
 static CodexStatus g_polled_status;
 static String g_polled_connection;
-static char g_viewed_id_buf[64] = {};
-static volatile bool g_viewed_pending = false;
 
 /* ========== Serial Helpers ========== */
 static String serial_safe_text(const String &value) {
@@ -122,7 +139,7 @@ static void log_status_snapshot(const char *connection, const CodexStatus &statu
     log_serial_field("index", i); log_serial_field("state", s.state);
     log_serial_field("status", s.status_zh); log_serial_field("title", s.title);
     log_serial_field("cwd", s.cwd); log_serial_field("updated_at", s.updated_at);
-    Serial.println();
+    log_serial_field("completed_at", s.completed_at); Serial.println();
   }
 }
 
@@ -187,7 +204,8 @@ static CodexStatus parse_status_json(const String &json) {
     session.status_zh = json_string_value(object_json, "status_zh");
     session.cwd = json_string_value(object_json, "cwd");
     session.updated_at = json_string_value(object_json, "updated_at");
-    session.detail = json_string_value(object_json, "detail");
+    session.completed_at = json_string_value(object_json, "completed_at");
+    session.last_user_at = json_string_value(object_json, "last_user_at");
     status.session_count++;
     search_pos = object_finish + 1;
   }
@@ -226,6 +244,77 @@ static String status_label_text(const CodexSession &session) {
   if (session.state == "blocked") return "已阻塞";
   if (session.state == "notLoaded") return "未运行";
   return "未知";
+}
+
+static int64_t parse_local_timestamp_ms(const String &value) {
+  if (!value.length()) return -1;
+  int y, mo, d, h, mi, s;
+  if (sscanf(value.c_str(), "%d-%d-%d %d:%d:%d", &y, &mo, &d, &h, &mi, &s) != 6) return -1;
+  if (y < 2000 || y > 2100) return -1;
+  struct tm t = {};
+  t.tm_year = y - 1900; t.tm_mon = mo - 1; t.tm_mday = d;
+  t.tm_hour = h; t.tm_min = mi; t.tm_sec = s;
+  time_t epoch = mktime(&t);
+  if (epoch < 0) return -1;
+  return (int64_t)epoch * 1000LL;
+}
+
+static String format_runtime(uint32_t elapsed_ms) {
+  uint32_t total_seconds = elapsed_ms / 1000;
+  uint32_t days = total_seconds / 86400;
+  uint32_t hours = (total_seconds % 86400) / 3600;
+  uint32_t minutes = (total_seconds % 3600) / 60;
+  uint32_t seconds = total_seconds % 60;
+  if (days > 0) {
+    return String(days) + "d " + String(hours) + "h " + String(minutes) + "m";
+  }
+  if (hours > 0) {
+    return String(hours) + "h " + String(minutes) + "m " + String(seconds) + "s";
+  }
+  return String(minutes) + "m " + String(seconds) + "s";
+}
+
+static String primary_meta_text(const CodexSession &primary, const CodexStatus &status) {
+  String project_text = primary.cwd.length() ? primary.cwd : "--";
+  String base = project_text;
+  if (primary.state == "active") {
+    int64_t start_ms = parse_local_timestamp_ms(primary.last_user_at);
+    if (start_ms > 0) {
+      struct timeval tv;
+      if (gettimeofday(&tv, NULL) == 0) {
+        int64_t now_ms = (int64_t)tv.tv_sec * 1000LL + (int64_t)(tv.tv_usec / 1000);
+        int64_t diff = now_ms - start_ms;
+        if (diff >= 0) {
+          return base + " · 运行 " + format_runtime((uint32_t)diff);
+        }
+      }
+    }
+  }
+  if (primary.state == "complete" && primary.completed_at.length()) {
+    return base + " · " + primary.completed_at;
+  }
+  String updated_text = primary.updated_at.length() ? primary.updated_at : (status.updated_at.length() ? status.updated_at : "--");
+  return base + " · " + updated_text;
+}
+
+static String secondary_meta_text(const CodexSession &session, const CodexStatus &status) {
+  if (session.state == "active") {
+    int64_t start_ms = parse_local_timestamp_ms(session.last_user_at);
+    if (start_ms > 0) {
+      struct timeval tv;
+      if (gettimeofday(&tv, NULL) == 0) {
+        int64_t now_ms = (int64_t)tv.tv_sec * 1000LL + (int64_t)(tv.tv_usec / 1000);
+        int64_t diff = now_ms - start_ms;
+        if (diff >= 0) {
+          return "运行 " + format_runtime((uint32_t)diff);
+        }
+      }
+    }
+  }
+  if (session.state == "complete" && session.completed_at.length()) {
+    return session.completed_at;
+  }
+  return session.updated_at.length() ? session.updated_at : (status.updated_at.length() ? status.updated_at : "--");
 }
 
 static lv_color_t state_color(const String &state) {
@@ -273,14 +362,80 @@ static void build_visible_session_order(const CodexStatus &status, int order[3])
   }
 }
 
-static String detail_text_for_session(int session_index) {
-  if (session_index < 0 || session_index >= latest_status.session_count) return "暂无会话内容";
-  const String &detail = latest_status.sessions[session_index].detail;
-  return detail.length() ? detail : "暂无会话内容";
-}
-
 static void make_touch_event_bubble(lv_obj_t *obj) {
   if (obj != NULL) lv_obj_add_flag(obj, LV_OBJ_FLAG_EVENT_BUBBLE);
+}
+
+/* ========== Completion Flash ========== */
+static lv_color_t card_default_bg_color(bool is_primary) {
+  return lv_color_hex(is_primary ? 0x151B20 : 0x1D252C);
+}
+static lv_color_t card_flash_highlight_color(void) {
+  return lv_color_hex(0x74B9FF);  // mirrors the "complete" state color
+}
+static void trigger_card_flash(int slot) {
+  if (slot < 0 || slot >= 3) return;
+  lv_obj_t *card = (slot == 0) ? primary_card : secondary_cards[slot - 1];
+  if (card == NULL) return;
+  g_card_flash[slot].card = card;
+  g_card_flash[slot].is_primary = (slot == 0);
+  g_card_flash[slot].start_ms = millis();
+  g_card_flash[slot].active = true;
+  // First tick_card_flash call will set the breathing color; start from the
+  // default so the card doesn't flash-bang to full highlight.
+  lv_obj_set_style_bg_color(card, card_default_bg_color(g_card_flash[slot].is_primary), 0);
+}
+/* Drop flash state without touching styles — call before lv_obj_clean so
+ * tick_card_flash never writes to a freed card. */
+static void invalidate_card_flash(void) {
+  for (int i = 0; i < 3; ++i) {
+    g_card_flash[i].active = false;
+    g_card_flash[i].card = NULL;
+  }
+}
+/* Restore default background and clear state — call when the app is torn
+ * down only if the cards are still alive; otherwise use invalidate. */
+static void clear_card_flash(void) {
+  for (int i = 0; i < 3; ++i) {
+    if (g_card_flash[i].active && g_card_flash[i].card != NULL) {
+      lv_obj_set_style_bg_color(g_card_flash[i].card, card_default_bg_color(g_card_flash[i].is_primary), 0);
+    }
+    g_card_flash[i].active = false;
+    g_card_flash[i].card = NULL;
+  }
+}
+static void tick_card_flash(void) {
+  uint32_t now = millis();
+  for (int i = 0; i < 3; ++i) {
+    if (!g_card_flash[i].active) continue;
+    if (g_card_flash[i].card == NULL) {
+      g_card_flash[i].active = false;
+      continue;
+    }
+    uint32_t elapsed = now - g_card_flash[i].start_ms;
+    if (elapsed >= CARD_FLASH_DURATION_MS) {
+      lv_obj_set_style_bg_color(g_card_flash[i].card, card_default_bg_color(g_card_flash[i].is_primary), 0);
+      g_card_flash[i].active = false;
+      g_card_flash[i].card = NULL;
+      continue;
+    }
+    /* Breathing: (1 - cos(2π·phase))/2 gives a smooth 0→1→0 wave over one
+     * period; scaled to PEAK_RATIO so the highlight never exceeds 1/5 blend. */
+    float phase = (float)(elapsed % CARD_FLASH_BREATH_PERIOD_MS) / (float)CARD_FLASH_BREATH_PERIOD_MS;
+    float wave = (1.0f - cosf(phase * 2.0f * 3.14159265f)) * 0.5f;
+    uint8_t mix = (uint8_t)(wave * CARD_FLASH_PEAK_RATIO * 255.0f + 0.5f);
+    lv_color_t bg = lv_color_mix(card_flash_highlight_color(),
+                                 card_default_bg_color(g_card_flash[i].is_primary),
+                                 mix);
+    lv_obj_set_style_bg_color(g_card_flash[i].card, bg, 0);
+  }
+}
+static bool id_in_just_completed(const String &id, const String just_completed_ids[], int just_completed_count) {
+  if (!id.length()) return false;
+  for (int j = 0; j < just_completed_count; ++j) {
+    if (just_completed_ids[j] == id) return true;
+  }
+  return false;
 }
 
 /* ========== Touch Feedback ========== */
@@ -291,10 +446,6 @@ static void set_card_pressed_feedback(lv_obj_t *card, bool pressed) {
 static void set_secondary_card_pressed_feedback(lv_obj_t *card, bool pressed) {
   if (card == NULL) return;
   lv_obj_set_style_bg_color(card, lv_color_hex(pressed ? 0x303C46 : 0x1D252C), 0);
-}
-static void set_back_button_pressed_feedback(lv_obj_t *button, bool pressed) {
-  if (button == NULL) return;
-  lv_obj_set_style_bg_color(button, lv_color_hex(pressed ? 0x3A4A56 : 0x26313A), 0);
 }
 static bool session_pointer_inside(lv_obj_t *card) {
   if (card == NULL) return false;
@@ -345,31 +496,6 @@ static void session_feedback_event_cb(lv_event_t *event) {
   }
 }
 
-static void detail_back_feedback_event_cb(lv_event_t *event) {
-  lv_event_code_t code = lv_event_get_code(event);
-  lv_obj_t *target = (lv_obj_t *)lv_event_get_current_target(event);
-  if (code == LV_EVENT_PRESSED) {
-    back_press_cancelled = false; set_back_button_pressed_feedback(target, true);
-  } else if (code == LV_EVENT_PRESSING) {
-    if (!back_press_cancelled && !session_pointer_inside(target)) {
-      back_press_cancelled = true; set_back_button_pressed_feedback(target, false);
-    }
-  } else if (code == LV_EVENT_PRESS_LOST) {
-    back_press_cancelled = true; set_back_button_pressed_feedback(target, false);
-  } else if (code == LV_EVENT_RELEASED) {
-    if (!session_pointer_inside(target)) back_press_cancelled = true;
-    set_back_button_pressed_feedback(target, false);
-  }
-}
-
-/* ========== HTTP Viewed ========== */
-static String viewed_url_for_session(const String &session_id) {
-  String base_url = String(STATUS_URL);
-  int status_pos = base_url.lastIndexOf("/status");
-  if (status_pos >= 0) base_url = base_url.substring(0, status_pos);
-  return base_url + "/viewed?id=" + session_id;
-}
-
 /* ========== Background Poll Task ========== */
 static void codex_poll_task_func(void *arg) {
   uint32_t last_poll_ms = 0;
@@ -393,25 +519,6 @@ static void codex_poll_task_func(void *arg) {
       continue;
     }
     last_poll_ms = now;
-
-    // 再次检查退出标志
-    if (g_poll_task_should_exit) break;
-
-    /* Flush pending viewed notification */
-    if (g_viewed_pending) {
-      g_viewed_pending = false;
-      String vid = String(g_viewed_id_buf);
-      if (vid.length() && WiFi.status() == WL_CONNECTED) {
-        String url = viewed_url_for_session(vid);
-        HTTPClient http;
-        http.setTimeout(1000);  // 缩短超时
-        http.begin(url);
-        int code = http.GET();
-        Serial.print("CODEX_STATUS viewed"); log_serial_field("id", vid);
-        log_serial_field("code", code); Serial.println();
-        http.end();
-      }
-    }
 
     // 再次检查退出标志
     if (g_poll_task_should_exit) break;
@@ -464,60 +571,31 @@ static void codex_poll_task_func(void *arg) {
 
 /* ========== Navigation ========== */
 static void render_home_ui_locked();
-static void render_detail_ui_locked();
-static void bind_home_status_locked(const char *connection, const CodexStatus &status);
+static void bind_home_status_locked(const char *connection, const CodexStatus &status, const String just_completed_ids[], int just_completed_count);
 static void update_status_ui(const char *connection, const CodexStatus &status);
-
-static void open_session_detail(int session_index) {
-  if (session_index < 0 || session_index >= latest_status.session_count) return;
-  selected_session_index = session_index;
-  current_page = CODEX_PAGE_DETAIL;
-  const CodexSession &s = latest_status.sessions[session_index];
-  if (s.state == "complete" && s.id.length()) {
-    strncpy(g_viewed_id_buf, s.id.c_str(), sizeof(g_viewed_id_buf) - 1);
-    g_viewed_id_buf[sizeof(g_viewed_id_buf) - 1] = '\0';
-    g_viewed_pending = true;
-  }
-  Serial.print("CODEX_STATUS detail_open"); log_serial_field("index", session_index); Serial.println();
-  render_detail_ui_locked();
-}
-
-static void return_to_home() {
-  selected_session_index = -1;
-  current_page = CODEX_PAGE_HOME;
-  g_viewed_pending = false;
-  log_serial_event("CODEX_STATUS detail_back");
-  render_home_ui_locked();
-  bind_home_status_locked(latest_connection.c_str(), latest_status);
-}
-
-static void session_card_event_cb(lv_event_t *event) {
-  if (lv_event_get_code(event) != LV_EVENT_RELEASED) return;
-  lv_obj_t *target = (lv_obj_t *)lv_event_get_current_target(event);
-  int slot = (int)(intptr_t)lv_event_get_user_data(event);
-  if (slot < 0 || slot >= VISIBLE_SESSIONS) return;
-  if (session_press_cancelled[slot]) return;
-  if (!session_pointer_inside(target)) return;
-  open_session_detail(visible_session_indices[slot]);
-}
-
-static void return_to_home_event_cb(lv_event_t *event) {
-  if (lv_event_get_code(event) != LV_EVENT_RELEASED) return;
-  lv_obj_t *target = (lv_obj_t *)lv_event_get_current_target(event);
-  if (back_press_cancelled) return;
-  if (!session_pointer_inside(target)) return;
-  return_to_home();
-}
 
 /* ========== Launcher Back Button ========== */
 static void app_back_cb(lv_event_t *e) {
   (void)e; launcher_request_return_home();
 }
 
+/* ========== Sound Toggle Switch ========== */
+static void sound_toggle_cb(lv_event_t *e) {
+  lv_obj_t *sw = (lv_obj_t *)lv_event_get_target(e);
+  g_sound_enabled = lv_obj_has_state(sw, LV_STATE_CHECKED);
+  Preferences prefs;
+  prefs.begin(CODEX_SOUND_PREF_NS, false);
+  prefs.putBool(CODEX_SOUND_PREF_KEY, g_sound_enabled);
+  prefs.end();
+  Serial.print("CODEX_STATUS sound_toggle enabled=");
+  Serial.println(g_sound_enabled ? 1 : 0);
+}
+
 /* ========== UI Builders ========== */
 static void render_home_ui_locked() {
+  invalidate_card_flash();
+  primary_card = NULL;
   lv_obj_clean(g_app_scr);
-  detail_back_button = NULL; detail_content_label = NULL;
   lv_obj_set_style_bg_color(g_app_scr, lv_color_hex(0x101418), 0);
   lv_obj_set_style_pad_all(g_app_scr, 6, 0);
   lv_obj_set_style_pad_column(g_app_scr, 6, 0);
@@ -535,57 +613,6 @@ static void render_home_ui_locked() {
   lv_obj_set_style_pad_row(cp, 4, 0);
   lv_obj_set_flex_flow(cp, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_flex_align(cp, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-  /* Battery in companion */
-  lv_obj_t *battery_row = lv_obj_create(cp);
-  lv_obj_set_size(battery_row, 132, 24);
-  lv_obj_clear_flag(battery_row, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_set_style_bg_opa(battery_row, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_width(battery_row, 0, 0);
-  lv_obj_set_style_pad_all(battery_row, 0, 0);
-  lv_obj_set_style_pad_column(battery_row, 4, 0);
-  lv_obj_set_flex_flow(battery_row, LV_FLEX_FLOW_ROW);
-  lv_obj_set_flex_align(battery_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-  lv_obj_t *battery_icon = lv_obj_create(battery_row);
-  lv_obj_set_size(battery_icon, 32, 16);
-  lv_obj_clear_flag(battery_icon, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_set_style_bg_opa(battery_icon, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_width(battery_icon, 0, 0);
-  lv_obj_set_style_pad_all(battery_icon, 0, 0);
-
-  battery_body = lv_obj_create(battery_icon);
-  lv_obj_set_size(battery_body, 28, 14);
-  lv_obj_set_pos(battery_body, 0, 1);
-  lv_obj_set_style_bg_opa(battery_body, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_width(battery_body, 1, 0);
-  lv_obj_set_style_border_color(battery_body, lv_color_hex(0xF7FAFC), 0);
-  lv_obj_set_style_radius(battery_body, 3, 0);
-  lv_obj_set_style_pad_all(battery_body, 2, 0);
-
-  battery_fill = lv_obj_create(battery_body);
-  lv_obj_set_size(battery_fill, 0, 10);
-  lv_obj_set_pos(battery_fill, 0, 0);
-  lv_obj_set_style_bg_color(battery_fill, lv_color_hex(0x78F0A4), 0);
-  lv_obj_set_style_border_width(battery_fill, 0, 0);
-  lv_obj_set_style_radius(battery_fill, 1, 0);
-
-  battery_terminal = lv_obj_create(battery_icon);
-  lv_obj_set_size(battery_terminal, 3, 6);
-  lv_obj_set_pos(battery_terminal, 28, 5);
-  lv_obj_set_style_bg_color(battery_terminal, lv_color_hex(0xF7FAFC), 0);
-  lv_obj_set_style_border_width(battery_terminal, 0, 0);
-  lv_obj_set_style_radius(battery_terminal, 1, 0);
-
-  bolt_line = lv_line_create(battery_icon);
-  static lv_point_precise_t bolt_pts[] = {{9, 4}, {5, 8}, {10, 8}, {7, 12}};
-  lv_line_set_points(bolt_line, bolt_pts, 4);
-  lv_obj_set_style_line_width(bolt_line, 2, 0);
-  lv_obj_set_style_line_color(bolt_line, lv_color_hex(0xF0C86F), 0);
-  lv_obj_set_style_line_rounded(bolt_line, true, 0);
-  lv_obj_add_flag(bolt_line, LV_OBJ_FLAG_HIDDEN);
-
-  battery_pct_label = create_label(battery_row, "--%", lv_color_hex(0xF7FAFC), 56, codex_font_20());
 
   assistant_image = lv_image_create(cp);
   lv_image_set_src(assistant_image, &codex_img_idle);
@@ -612,6 +639,32 @@ static void render_home_ui_locked() {
   lv_obj_set_style_text_font(back_label, codex_font_16(), 0);
   lv_obj_set_style_text_color(back_label, lv_color_hex(0xF7FAFC), 0);
 
+  /* Sound toggle row — label + switch on a single flex row below the back button */
+  lv_obj_t *sound_row = lv_obj_create(cp);
+  lv_obj_set_size(sound_row, LV_PCT(100), LV_SIZE_CONTENT);
+  lv_obj_clear_flag(sound_row, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_style_bg_color(sound_row, lv_color_hex(0x1A2230), 0);
+  lv_obj_set_style_radius(sound_row, 6, 0);
+  lv_obj_set_style_border_width(sound_row, 0, 0);
+  lv_obj_set_style_pad_all(sound_row, 6, 0);
+  lv_obj_set_style_pad_column(sound_row, 8, 0);
+  lv_obj_set_flex_flow(sound_row, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(sound_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+  lv_obj_t *sound_label = lv_label_create(sound_row);
+  lv_label_set_text(sound_label, "提示音");
+  lv_obj_set_style_text_font(sound_label, codex_font_16(), 0);
+  lv_obj_set_style_text_color(sound_label, lv_color_hex(0xF7FAFC), 0);
+
+  g_sound_btn = lv_switch_create(sound_row);
+  lv_obj_set_size(g_sound_btn, 50, 24);
+  lv_obj_add_event_cb(g_sound_btn, sound_toggle_cb, LV_EVENT_VALUE_CHANGED, NULL);
+  if (g_sound_enabled) {
+    lv_obj_add_state(g_sound_btn, LV_STATE_CHECKED);
+  } else {
+    lv_obj_clear_state(g_sound_btn, LV_STATE_CHECKED);
+  }
+
   /* Primary panel */
   lv_obj_t *pp = lv_obj_create(g_app_scr);
   lv_obj_set_size(pp, PRIMARY_PANEL_W, PANEL_H);
@@ -625,7 +678,7 @@ static void render_home_ui_locked() {
   lv_obj_set_flex_align(pp, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
   lv_obj_add_flag(pp, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_event_cb(pp, session_feedback_event_cb, LV_EVENT_ALL, (void *)0);
-  lv_obj_add_event_cb(pp, session_card_event_cb, LV_EVENT_RELEASED, (void *)0);
+  primary_card = pp;
 
   lv_obj_t *psr = lv_obj_create(pp);
   make_touch_event_bubble(psr);
@@ -674,12 +727,11 @@ static void render_home_ui_locked() {
     lv_obj_set_style_border_width(secondary_cards[i], 0, 0);
     lv_obj_set_style_radius(secondary_cards[i], 6, 0);
     lv_obj_set_style_pad_all(secondary_cards[i], 6, 0);
-    lv_obj_set_style_pad_row(secondary_cards[i], 5, 0);
+    lv_obj_set_style_pad_row(secondary_cards[i], 4, 0);
     lv_obj_set_flex_flow(secondary_cards[i], LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(secondary_cards[i], LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
     lv_obj_add_flag(secondary_cards[i], LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(secondary_cards[i], session_feedback_event_cb, LV_EVENT_ALL, (void *)(intptr_t)(i + 1));
-    lv_obj_add_event_cb(secondary_cards[i], session_card_event_cb, LV_EVENT_RELEASED, (void *)(intptr_t)(i + 1));
 
     lv_obj_t *sr = lv_obj_create(secondary_cards[i]);
     make_touch_event_bubble(sr);
@@ -702,79 +754,17 @@ static void render_home_ui_locked() {
     secondary_titles[i] = create_label(secondary_cards[i], "--", lv_color_hex(0xE9EEF2), SECONDARY_TITLE_W);
     make_touch_event_bubble(secondary_titles[i]); lv_obj_set_height(secondary_titles[i], 20);
     lv_label_set_long_mode(secondary_titles[i], LV_LABEL_LONG_DOT);
+
+    secondary_metas[i] = create_label(secondary_cards[i], "--", lv_color_hex(0x8FA1AD), SECONDARY_TITLE_W);
+    make_touch_event_bubble(secondary_metas[i]); lv_obj_set_height(secondary_metas[i], 16);
+    lv_label_set_long_mode(secondary_metas[i], LV_LABEL_LONG_DOT);
+
     lv_obj_add_flag(secondary_cards[i], LV_OBJ_FLAG_HIDDEN);
   }
 }
 
-static void render_detail_ui_locked() {
-  lv_obj_clean(g_app_scr);
-  // Clear home widget pointers - they're deleted by lv_obj_clean
-  connection_label = NULL;
-  assistant_image = NULL;
-  battery_pct_label = NULL;
-  battery_fill = NULL;
-  battery_body = NULL;
-  battery_terminal = NULL;
-  bolt_line = NULL;
-  companion_state_label = NULL;
-  primary_status_dot = NULL;
-  primary_status_label = NULL;
-  primary_title_label = NULL;
-  primary_meta_label = NULL;
-  for (int i = 0; i < SECONDARY_SESSIONS; i++) {
-    secondary_cards[i] = NULL;
-    secondary_dots[i] = NULL;
-    secondary_statuses[i] = NULL;
-    secondary_titles[i] = NULL;
-  }
-  lv_obj_set_style_bg_color(g_app_scr, lv_color_hex(0x101418), 0);
-  lv_obj_set_style_pad_all(g_app_scr, 6, 0);
-  lv_obj_set_style_pad_column(g_app_scr, 6, 0);
-  lv_obj_set_flex_flow(g_app_scr, LV_FLEX_FLOW_ROW);
-  lv_obj_set_flex_align(g_app_scr, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-
-  lv_obj_t *content_panel = lv_obj_create(g_app_scr);
-  lv_obj_set_size(content_panel, DETAIL_CONTENT_W, PANEL_H);
-  lv_obj_set_style_bg_color(content_panel, lv_color_hex(0x151B20), 0);
-  lv_obj_set_style_border_width(content_panel, 0, 0);
-  lv_obj_set_style_radius(content_panel, 6, 0);
-  lv_obj_set_style_pad_all(content_panel, 8, 0);
-  lv_obj_set_scroll_dir(content_panel, LV_DIR_VER);
-
-  detail_content_label = create_label(content_panel, "", lv_color_hex(0xD8E1E7), DETAIL_CONTENT_W - 20);
-  lv_label_set_long_mode(detail_content_label, LV_LABEL_LONG_WRAP);
-  String detail_text = detail_text_for_session(selected_session_index);
-  lv_label_set_text(detail_content_label, detail_text.c_str());
-
-  lv_obj_t *back_panel = lv_obj_create(g_app_scr);
-  lv_obj_set_size(back_panel, DETAIL_BACK_PANEL_W, PANEL_H);
-  lv_obj_clear_flag(back_panel, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_set_style_bg_color(back_panel, lv_color_hex(0x151B20), 0);
-  lv_obj_set_style_border_width(back_panel, 0, 0);
-  lv_obj_set_style_radius(back_panel, 6, 0);
-  lv_obj_set_style_pad_all(back_panel, 7, 0);
-  lv_obj_set_flex_flow(back_panel, LV_FLEX_FLOW_COLUMN);
-  lv_obj_set_flex_align(back_panel, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-  detail_back_button = lv_obj_create(back_panel);
-  lv_obj_set_size(detail_back_button, 68, 44);
-  lv_obj_clear_flag(detail_back_button, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_add_flag(detail_back_button, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_set_style_bg_color(detail_back_button, lv_color_hex(0x26313A), 0);
-  lv_obj_set_style_border_width(detail_back_button, 0, 0);
-  lv_obj_set_style_radius(detail_back_button, 6, 0);
-  lv_obj_set_style_pad_all(detail_back_button, 0, 0);
-  lv_obj_add_event_cb(detail_back_button, detail_back_feedback_event_cb, LV_EVENT_ALL, NULL);
-  lv_obj_add_event_cb(detail_back_button, return_to_home_event_cb, LV_EVENT_RELEASED, NULL);
-
-  lv_obj_t *back_lbl = create_label(detail_back_button, "返回", lv_color_hex(0xF7FAFC), 68);
-  make_touch_event_bubble(back_lbl);
-  lv_obj_set_style_text_align(back_lbl, LV_TEXT_ALIGN_CENTER, 0);
-  lv_obj_center(back_lbl);
-}
-
 /* ========== Status Binding ========== */
-static void bind_home_status_locked(const char *connection, const CodexStatus &status) {
+static void bind_home_status_locked(const char *connection, const CodexStatus &status, const String just_completed_ids[], int just_completed_count) {
   set_label_text(connection_label, String("网络：") + connection);
 
   int order[3] = {};
@@ -785,15 +775,16 @@ static void bind_home_status_locked(const char *connection, const CodexStatus &s
     const CodexSession &primary = status.sessions[order[0]];
     String status_text = status_label_text(primary);
     String title_text = primary.title.length() ? primary.title : "未命名会话";
-    String project_text = primary.cwd.length() ? primary.cwd : "--";
-    String updated_text = primary.updated_at.length() ? primary.updated_at : (status.updated_at.length() ? status.updated_at : "--");
     set_label_text(companion_state_label, status_text);
     lv_obj_set_style_text_color(companion_state_label, state_color(primary.state), 0);
     set_label_text(primary_status_label, status_text);
     lv_obj_set_style_text_color(primary_status_label, state_color(primary.state), 0);
     lv_obj_set_style_bg_color(primary_status_dot, state_color(primary.state), 0);
     set_label_text(primary_title_label, title_text);
-    set_label_text(primary_meta_label, project_text + " · " + updated_text);
+    set_label_text(primary_meta_label, primary_meta_text(primary, status));
+    if (id_in_just_completed(primary.id, just_completed_ids, just_completed_count)) {
+      trigger_card_flash(0);
+    }
   } else {
     String conn(connection ? connection : "");
     bool err = conn.indexOf("失败") >= 0 || conn.indexOf("错误") >= 0 || conn.indexOf("断开") >= 0;
@@ -815,8 +806,12 @@ static void bind_home_status_locked(const char *connection, const CodexStatus &s
       set_label_text(secondary_statuses[i], status_label_text(session));
       lv_obj_set_style_text_color(secondary_statuses[i], state_color(session.state), 0);
       set_label_text(secondary_titles[i], session.title.length() ? session.title : "未命名会话");
+      set_label_text(secondary_metas[i], secondary_meta_text(session, status));
       lv_obj_set_style_bg_color(secondary_dots[i], state_color(session.state), 0);
       lv_obj_remove_flag(secondary_cards[i], LV_OBJ_FLAG_HIDDEN);
+      if (id_in_just_completed(session.id, just_completed_ids, just_completed_count)) {
+        trigger_card_flash(i + 1);
+      }
     } else {
       lv_obj_add_flag(secondary_cards[i], LV_OBJ_FLAG_HIDDEN);
     }
@@ -824,29 +819,68 @@ static void bind_home_status_locked(const char *connection, const CodexStatus &s
 }
 
 static void update_status_ui(const char *connection, const CodexStatus &status) {
+  /* Detect sessions that just transitioned into "complete" by comparing
+   * against the previous snapshot. Only sessions already seen before are
+   * eligible — newly-appeared sessions are not a transition. This reads
+   * g_prev_* (main-thread-only) so it is safe outside the LVGL lock. */
+  String just_completed_ids[5];
+  int just_completed_count = 0;
+  if (g_prev_session_count > 0) {
+    for (int i = 0; i < status.session_count; ++i) {
+      if (status.sessions[i].state != "complete") continue;
+      const String &id = status.sessions[i].id;
+      if (!id.length()) continue;
+      for (int j = 0; j < g_prev_session_count; ++j) {
+        if (g_prev_session_ids[j] == id) {
+          if (g_prev_session_states[j] != "complete") {
+            just_completed_ids[just_completed_count++] = id;
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  if (!lvgl_port_lock(200)) return;  // 缩短超时
+  /* Mutate the global snapshot under the LVGL lock. */
   latest_status = status;
   latest_connection = String(connection ? connection : "");
-  if (!lvgl_port_lock(200)) return;  // 缩短超时
-  if (current_page == CODEX_PAGE_DETAIL) {
-    if (selected_session_index < 0 || selected_session_index >= latest_status.session_count) {
-      selected_session_index = -1; current_page = CODEX_PAGE_HOME;
-      render_home_ui_locked(); bind_home_status_locked(connection, latest_status);
-      lvgl_port_unlock(); log_status_snapshot(connection, status); return;
-    }
-    set_label_text(detail_content_label, detail_text_for_session(selected_session_index));
-    lvgl_port_unlock(); log_status_snapshot(connection, status); return;
+  for (int i = 0; i < status.session_count; ++i) {
+    g_prev_session_ids[i] = status.sessions[i].id;
+    g_prev_session_states[i] = status.sessions[i].state;
   }
-  bind_home_status_locked(connection, status);
+  g_prev_session_count = status.session_count;
+
+  bind_home_status_locked(connection, status, just_completed_ids, just_completed_count);
   lvgl_port_unlock();
+
+  // 任务完成提示音：有任意会话从非完成变为完成时播放（受开关控制）
+  if (just_completed_count > 0 && g_sound_enabled) {
+    audio_bsp_play_complete_sound();
+    Serial.print("CODEX_STATUS complete_sound_triggered count=");
+    Serial.println(just_completed_count);
+  }
+
   log_status_snapshot(connection, status);
 }
 
 /* ========== WiFi & HTTP Polling ========== */
 bool codex_wifi_is_connected() { return g_wifi_connected; }
 
-void codex_connect_wifi() {
+bool codex_connect_wifi() {
+  // 暂时移除 fallback：NVS 无凭据直接返回 false，让开机自动进配网模式。
+  // WIFI_SSID/WIFI_PASSWORD 常量保留，测试完配网流程后可恢复 fallback。
+  char nvs_ssid[33] = {0};
+  char nvs_pwd[64]  = {0};
+  if (!wifi_config_get_stored(nvs_ssid, sizeof(nvs_ssid), nvs_pwd, sizeof(nvs_pwd))) {
+    Serial.println("CODEX_STATUS wifi_no_stored_entering_config");
+    g_wifi_connected = false;
+    return false;
+  }
+  Serial.print("CODEX_STATUS wifi_using_nvs ssid=");
+  Serial.println(nvs_ssid);
   log_serial_event("CODEX_STATUS wifi_connecting");
-  WiFi.mode(WIFI_STA); WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.mode(WIFI_STA); WiFi.begin(nvs_ssid, nvs_pwd);
   uint32_t started_ms = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - started_ms < 20000) delay(250);
   if (WiFi.status() == WL_CONNECTED) {
@@ -854,63 +888,33 @@ void codex_connect_wifi() {
     String ip = WiFi.localIP().toString();
     Serial.print("CODEX_STATUS wifi_connected"); log_serial_field("ip", ip);
     log_serial_field("rssi", WiFi.RSSI()); Serial.println();
+    configTzTime("CST-8", "pool.ntp.org", "ntp.aliyun.com");
+    Serial.println("CODEX_STATUS ntp_started");
+    return true;
   } else {
     g_wifi_connected = false;
     log_serial_event("CODEX_STATUS wifi_failed");
-  }
-}
-
-/* ========== Battery Polling (Codex internal) ========== */
-static int voltage_to_percent(float v) {
-  if (v <= BATTERY_VOLTAGE_MIN) return 0;
-  if (v >= BATTERY_VOLTAGE_MAX) return 100;
-  return (int)((v - BATTERY_VOLTAGE_MIN) / (BATTERY_VOLTAGE_MAX - BATTERY_VOLTAGE_MIN) * 100.0f + 0.5f);
-}
-static lv_color_t percent_color(int pct) {
-  if (pct < 20) return lv_color_hex(0xFF7E7E);
-  if (pct < 60) return lv_color_hex(0xF0C86F);
-  return lv_color_hex(0x78F0A4);
-}
-static void poll_battery() {
-  // Don't poll battery UI when on detail page (no battery widgets there)
-  if (current_page == CODEX_PAGE_DETAIL) return;
-  if (battery_pct_label == NULL || battery_fill == NULL || battery_body == NULL) return;
-  float volts = 0; int raw = 0;
-  adc_get_value(&volts, &raw);
-  bool charging = gpio_get_level(GPIO_NUM_16) != 0;
-  int pct = voltage_to_percent(volts);
-  lv_color_t color = percent_color(pct);
-  int fill_w = pct * 24 / 100;
-  if (fill_w < 0) fill_w = 0; if (fill_w > 24) fill_w = 24;
-  if (lvgl_port_lock(-1)) {
-    char buf[16]; snprintf(buf, sizeof(buf), "%d%%", pct);
-    lv_label_set_text(battery_pct_label, buf);
-    lv_obj_set_style_text_color(battery_pct_label, color, 0);
-    lv_obj_set_width(battery_fill, fill_w);
-    lv_obj_set_style_bg_color(battery_fill, color, 0);
-    lv_obj_set_style_border_color(battery_body, color, 0);
-    if (battery_terminal != NULL) {
-      lv_obj_set_style_bg_color(battery_terminal, color, 0);
-    }
-    if (bolt_line != NULL) {
-      if (charging) lv_obj_clear_flag(bolt_line, LV_OBJ_FLAG_HIDDEN);
-      else lv_obj_add_flag(bolt_line, LV_OBJ_FLAG_HIDDEN);
-    }
-    lvgl_port_unlock();
+    return false;
   }
 }
 
 /* ========== App Lifecycle ========== */
 lv_obj_t *app_codex_create(void) {
+  /* Load sound toggle preference from NVS */
+  {
+    Preferences prefs;
+    prefs.begin(CODEX_SOUND_PREF_NS, true);
+    g_sound_enabled = prefs.getBool(CODEX_SOUND_PREF_KEY, true);
+    prefs.end();
+  }
+
   g_app_scr = lv_obj_create(NULL);
   lv_obj_clear_flag(g_app_scr, LV_OBJ_FLAG_SCROLLABLE);
   render_home_ui_locked();
-  last_battery_poll_ms = millis();
 
   g_poll_mutex = xSemaphoreCreateMutex();
   g_poll_dirty = false;
-  g_viewed_pending = false;
-  g_poll_task_should_exit = false;  // 清除退出标志
+  g_poll_task_should_exit = false;
   xTaskCreatePinnedToCore(codex_poll_task_func, "codex_poll", 8192, NULL, 1, &g_poll_task_handle, 0);
 
   return g_app_scr;
@@ -948,20 +952,20 @@ void app_codex_destroy(lv_obj_t *scr) {
   }
 
   // 6. 清空所有 widget 指针
-  connection_label = NULL; assistant_image = NULL;
-  battery_pct_label = NULL; battery_fill = NULL; battery_body = NULL;
-  battery_terminal = NULL; bolt_line = NULL; companion_state_label = NULL;
+  invalidate_card_flash();
+  primary_card = NULL;
+  connection_label = NULL; assistant_image = NULL; companion_state_label = NULL;
   primary_status_dot = NULL; primary_status_label = NULL;
   primary_title_label = NULL; primary_meta_label = NULL;
   for (int i = 0; i < SECONDARY_SESSIONS; i++) {
     secondary_cards[i] = NULL; secondary_dots[i] = NULL;
     secondary_statuses[i] = NULL; secondary_titles[i] = NULL;
+    secondary_metas[i] = NULL;
   }
-  detail_back_button = NULL; detail_content_label = NULL;
-  current_page = CODEX_PAGE_HOME;
-  selected_session_index = -1;
-  g_poll_dirty = false; g_viewed_pending = false;
+  g_poll_dirty = false;
   g_poll_task_should_exit = false;
+  g_prev_session_count = 0;
+  g_sound_btn = NULL;
 }
 
 void app_codex_tick(lv_obj_t *scr) {
@@ -973,9 +977,32 @@ void app_codex_tick(lv_obj_t *scr) {
     xSemaphoreGive(g_poll_mutex);
     update_status_ui(connection.c_str(), status);
   }
+  if (g_app_scr != NULL && lvgl_port_lock(50)) {
+    tick_card_flash();
+    lvgl_port_unlock();
+  }
   uint32_t now_ms = millis();
-  if (now_ms - last_battery_poll_ms >= BATTERY_POLL_INTERVAL_MS) {
-    last_battery_poll_ms = now_ms;
-    poll_battery();
+  if (g_app_scr != NULL &&
+      now_ms - last_runtime_refresh_ms >= RUNTIME_REFRESH_INTERVAL_MS) {
+    last_runtime_refresh_ms = now_ms;
+    if (lvgl_port_lock(50)) {
+      if (visible_session_indices[0] >= 0 &&
+          visible_session_indices[0] < latest_status.session_count) {
+        const CodexSession &primary = latest_status.sessions[visible_session_indices[0]];
+        if (primary.state == "active") {
+          set_label_text(primary_meta_label, primary_meta_text(primary, latest_status));
+        }
+      }
+      for (int i = 0; i < SECONDARY_SESSIONS; ++i) {
+        int idx = visible_session_indices[i + 1];
+        if (idx >= 0 && idx < latest_status.session_count) {
+          const CodexSession &session = latest_status.sessions[idx];
+          if (session.state == "active") {
+            set_label_text(secondary_metas[i], secondary_meta_text(session, latest_status));
+          }
+        }
+      }
+      lvgl_port_unlock();
+    }
   }
 }

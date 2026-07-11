@@ -1,5 +1,6 @@
 #include "app_settings.h"
 #include "src/lcd_bl_bsp/lcd_bl_pwm_bsp.h"
+#include "src/audio_bsp/audio_bsp.h"
 #include "core/lv_obj_event_private.h"
 #include <Preferences.h>
 
@@ -95,6 +96,7 @@ static void volume_changed_cb(lv_event_t *e) {
   if (val == s_last_volume) return;
   s_last_volume = val;
   g_volume = val;
+  audio_bsp_set_volume(val);
   char buf[16]; snprintf(buf, sizeof(buf), "%d%%", val);
   if (volume_label) lv_label_set_text(volume_label, buf);
 }
@@ -122,16 +124,22 @@ static void volume_released_cb(lv_event_t *e) {
   settings_save_volume(val);
 }
 
+/* Test button now plays the completion sound instead of flashing backlight.
+ * The user can drag the volume slider, then tap this button to preview the
+ * actual sound volume. */
 static void play_test_tone_cb(lv_event_t *e) {
   (void)e;
-  if (brightness_slider == NULL) return;
-  uint16_t saved = 255 - (uint16_t)lv_slider_get_value(brightness_slider);
-  for (int i = 0; i < 120; i++) {
-    setUpduty(i % 2 == 0 ? (uint16_t)200 : (uint16_t)0);
-    delayMicroseconds(500);
-  }
-  setUpduty(saved);
-  s_last_brightness_duty = -1;
+  audio_bsp_play_complete_sound();
+  Serial.println("CODEX_SETTINGS test_sound_triggered");
+}
+
+static void wifi_config_cb(lv_event_t *e) {
+  (void)e;
+  // 从 settings 内无法直接 switch（launcher_switch_to 开头 if(g_current_app!=NULL) return 会拒绝）。
+  // 同时设 return_home + switch：launcher_process_pending 第一轮 destroy settings 回主页，
+  // 第二轮（下个 loop 迭代）g_current_app 已 NULL，switch 成功进入 wifi_config。
+  launcher_request_return_home();
+  launcher_request_switch(app_idx::WIFI_CONFIG);
 }
 
 static lv_obj_t *build_setting_row(lv_obj_t *parent,
@@ -194,12 +202,13 @@ lv_obj_t *app_settings_create(void) {
   lv_obj_set_style_text_font(title, codex_font_20(), 0);
   lv_obj_set_style_text_color(title, lv_color_hex(0xF7FAFC), 0);
 
-  /* Brightness row */
+  /* Brightness row — disabled (backlight PWM not functional on V2 board)
   brightness_slider = build_setting_row(g_scr, "亮度", 1, 255, g_brightness,
                                           lv_color_hex(0x78F0A4),
                                           &brightness_label,
                                           brightness_changed_cb);
   lv_obj_add_event_cb(brightness_slider, brightness_released_cb, LV_EVENT_RELEASED, NULL);
+  */
 
   /* Volume row */
   volume_slider = build_setting_row(g_scr, "音量", 0, 100, g_volume,
@@ -225,10 +234,22 @@ lv_obj_t *app_settings_create(void) {
   lv_obj_set_style_border_width(test_btn, 0, 0);
   lv_obj_add_event_cb(test_btn, play_test_tone_cb, LV_EVENT_RELEASED, NULL);
   lv_obj_t *tbl = lv_label_create(test_btn);
-  lv_label_set_text(tbl, "测试背光");
+  lv_label_set_text(tbl, "测试提示音");
   lv_obj_center(tbl);
   lv_obj_set_style_text_font(tbl, codex_font_16(), 0);
   lv_obj_set_style_text_color(tbl, lv_color_hex(0x74B9FF), 0);
+
+  lv_obj_t *wifi_btn = lv_btn_create(bottom);
+  lv_obj_set_size(wifi_btn, 120, 30);
+  lv_obj_set_style_bg_color(wifi_btn, lv_color_hex(0x1D3D5C), 0);
+  lv_obj_set_style_radius(wifi_btn, 6, 0);
+  lv_obj_set_style_border_width(wifi_btn, 0, 0);
+  lv_obj_add_event_cb(wifi_btn, wifi_config_cb, LV_EVENT_RELEASED, NULL);
+  lv_obj_t *wlbl = lv_label_create(wifi_btn);
+  lv_label_set_text(wlbl, "WiFi 配网");
+  lv_obj_center(wlbl);
+  lv_obj_set_style_text_font(wlbl, codex_font_16(), 0);
+  lv_obj_set_style_text_color(wlbl, lv_color_hex(0x74B9FF), 0);
 
   lv_obj_t *btn = lv_btn_create(bottom);
   lv_obj_set_size(btn, 100, 30);

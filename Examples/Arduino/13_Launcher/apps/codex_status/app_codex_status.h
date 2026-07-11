@@ -14,5 +14,5 @@ lv_obj_t *app_codex_create(void);
 void app_codex_destroy(lv_obj_t *scr);
 void app_codex_tick(lv_obj_t *scr);
 
-void codex_connect_wifi(void);
+bool codex_connect_wifi(void);
 bool codex_wifi_is_connected(void);

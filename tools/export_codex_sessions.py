@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,10 +14,14 @@ STATE_LABELS_ZH = {
     "blocked": "\u5df2\u963b\u585e",
 }
 MAX_SCREEN_TITLE_CHARS = 24
-MAX_DETAIL_MESSAGES = 4
-MAX_DETAIL_CHARS = 260
 ACTIVE_RECENT_SECONDS = 120
 COMPLETE_VISIBLE_SECONDS = 600
+
+# Number of lines to read from the tail of each rollout file.  Rollout files are
+# JSONL appended sequentially; the session_meta is at the top, but the event
+# types we care about (last_event_msg_type, completed_at) are near the bottom.
+# Reading only the tail avoids loading multi-megabyte files in full every cycle.
+_ROLLOUT_TAIL_LINES = 200
 
 
 def _default_codex_home():
@@ -28,13 +33,6 @@ def _read_json_file(path):
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
-
-
-def _read_viewed_sessions(viewed_file):
-    if not viewed_file:
-        return {}
-    data = _read_json_file(Path(viewed_file))
-    return data if isinstance(data, dict) else {}
 
 
 def _read_session_index(codex_home):
@@ -81,27 +79,58 @@ def _text_from_message_payload(payload):
     return _message_text(payload)
 
 
-def _detail_line_from_message_payload(payload):
-    if not isinstance(payload, dict):
-        return ""
-    role = payload.get("role")
-    if role not in {"user", "assistant"}:
-        return ""
-    text = _message_text(payload)
-    if not text:
-        return ""
-    prefix = "\u7528\u6237\uff1a" if role == "user" else "\u52a9\u624b\uff1a"
-    return f"{prefix}{text}"
+def _tail_lines(path, n=_ROLLOUT_TAIL_LINES):
+    """Read the last *n* lines of *path* efficiently.
+
+    For files smaller than a threshold we fall back to ``read_text().splitlines()``.
+    For large files we seek from the end and decode backwards to avoid loading
+    the entire file into memory.
+    """
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return []
+
+    # Small file: just read it all.
+    if size <= 65536:
+        try:
+            return path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return []
+
+    # Large file: read from the end.
+    # Estimate ~4 bytes per line for safety; read at least 8 KB.
+    chunk_size = max(8192, n * 8)
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            pos = fh.tell()
+            collected = b""
+            while pos > 0 and collected.count(b"\n") <= n:
+                read_size = min(chunk_size, pos)
+                pos -= read_size
+                fh.seek(pos)
+                chunk = fh.read(read_size)
+                collected = chunk + collected
+                if len(collected) > chunk_size * 4:  # safety cap
+                    break
+            # Trim to last n lines.
+            all_lines = collected.decode("utf-8", errors="replace").splitlines()
+            return all_lines[-n:] if len(all_lines) > n else all_lines
+    except OSError:
+        return []
 
 
-def _screen_detail(lines):
-    detail = "\n".join(lines[-MAX_DETAIL_MESSAGES:])
-    if len(detail) <= MAX_DETAIL_CHARS:
-        return detail
-    return detail[: MAX_DETAIL_CHARS - 3].rstrip() + "..."
+def _read_rollout_sessions(codex_home, scan_limit=20, mtime_cache=None):
+    """Read recent rollout session files.
 
-
-def _read_rollout_sessions(codex_home, scan_limit=20):
+    Parameters
+    ----------
+    mtime_cache : dict | None
+        If provided, used to skip files whose mtime hasn't changed since the
+        last call.  The dict maps ``str(path)`` → ``(mtime, entry_dict)`` and is
+        updated in place with fresh entries.
+    """
     sessions_dir = Path(codex_home) / "sessions"
     try:
         rollout_files = sorted(
@@ -113,14 +142,75 @@ def _read_rollout_sessions(codex_home, scan_limit=20):
         return []
 
     sessions = []
+    cache = mtime_cache if mtime_cache is not None else {}
+
     for rollout_file in rollout_files:
-        entry = {}
         try:
-            lines = rollout_file.read_text(encoding="utf-8").splitlines()
+            stat = rollout_file.stat()
+            mtime = stat.st_mtime
         except OSError:
             continue
 
-        last_event_msg_type = ""
+        cache_key = str(rollout_file)
+        cached = cache.get(cache_key)
+
+        if cached is not None and cached[0] == mtime:
+            # File hasn't changed — reuse cached entry.
+            entry = cached[1]
+            if entry:
+                sessions.append(entry)
+            continue
+
+        # File is new or modified — read it.
+        entry = _parse_rollout_file(rollout_file, mtime)
+        cache[cache_key] = (mtime, entry)
+        if entry:
+            sessions.append(entry)
+
+    # Prune cache entries that are no longer in the top scan_limit.
+    current_keys = {str(f) for f in rollout_files}
+    stale_keys = [k for k in cache if k not in current_keys]
+    for k in stale_keys:
+        del cache[k]
+
+    return sessions
+
+
+def _parse_rollout_file(rollout_file, mtime):
+    """Parse a single rollout JSONL file, returning an entry dict."""
+    lines = _tail_lines(rollout_file)
+    if not lines:
+        return {}
+
+    entry = {}
+    last_event_msg_type = ""
+
+    # We need session_meta which is at the top of the file.  If our tail read
+    # didn't capture it, we'll try reading the first few lines.
+    has_meta = any('"session_meta"' in line for line in lines[:5])
+
+    if not has_meta:
+        try:
+            with open(rollout_file, "r", encoding="utf-8") as fh:
+                # Read just enough lines to find session_meta.
+                for _ in range(10):
+                    line = fh.readline()
+                    if not line:
+                        break
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if event.get("type") == "session_meta" and isinstance(event.get("payload"), dict):
+                        payload = event["payload"]
+                        entry["id"] = str(payload.get("id") or "")
+                        entry["cwd"] = str(payload.get("cwd") or "")
+                        entry["updated_at"] = str(event.get("timestamp") or payload.get("timestamp") or "")
+                        break
+        except OSError:
+            pass
+    else:
+        # session_meta is in the tail we already read.
         for line in lines:
             try:
                 event = json.loads(line)
@@ -131,32 +221,35 @@ def _read_rollout_sessions(codex_home, scan_limit=20):
                 entry["id"] = str(payload.get("id") or "")
                 entry["cwd"] = str(payload.get("cwd") or "")
                 entry["updated_at"] = str(event.get("timestamp") or payload.get("timestamp") or "")
-            elif event.get("type") == "response_item" and not entry.get("thread_name"):
-                title = _text_from_message_payload(event.get("payload"))
-                if title:
-                    entry["thread_name"] = title
-            if event.get("type") == "response_item":
-                detail_line = _detail_line_from_message_payload(event.get("payload"))
-                if detail_line:
-                    entry.setdefault("detail_lines", []).append(detail_line)
-            if event.get("type") == "event_msg" and isinstance(event.get("payload"), dict):
-                msg_type = str(event["payload"].get("type") or "")
-                if msg_type:
-                    last_event_msg_type = msg_type
-                    if msg_type in {"task_complete", "shutdown_complete"}:
-                        entry["completed_at"] = str(event.get("timestamp") or "")
+                break
 
-        if entry.get("id"):
-            entry.setdefault("thread_name", "\u672a\u547d\u540d\u4f1a\u8bdd")
-            entry["detail"] = _screen_detail(entry.get("detail_lines", []))
-            entry.pop("detail_lines", None)
-            entry["last_event_msg_type"] = last_event_msg_type
-            try:
-                entry["rollout_mtime"] = rollout_file.stat().st_mtime
-            except OSError:
-                entry["rollout_mtime"] = 0.0
-            sessions.append(entry)
-    return sessions
+    # Scan all tail lines for thread_name and event status.
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "response_item" and not entry.get("thread_name"):
+            title = _text_from_message_payload(event.get("payload"))
+            if title:
+                entry["thread_name"] = title
+        if event.get("type") == "response_item":
+            if isinstance(event.get("payload"), dict) and event["payload"].get("role") == "user":
+                user_ts = str(event.get("timestamp") or "")
+                if user_ts:
+                    entry["last_user_at"] = user_ts
+        if event.get("type") == "event_msg" and isinstance(event.get("payload"), dict):
+            msg_type = str(event["payload"].get("type") or "")
+            if msg_type:
+                last_event_msg_type = msg_type
+                if msg_type in {"task_complete", "shutdown_complete"}:
+                    entry["completed_at"] = str(event.get("timestamp") or "")
+
+    if entry.get("id"):
+        entry.setdefault("thread_name", "\u672a\u547d\u540d\u4f1a\u8bdd")
+        entry["last_event_msg_type"] = last_event_msg_type
+        entry["rollout_mtime"] = mtime
+    return entry
 
 
 def _parse_time(value):
@@ -251,18 +344,10 @@ def _completion_time(entry):
     return _parse_time(entry.get("updated_at"))
 
 
-def _is_viewed_complete(entry, viewed_sessions):
-    thread_id = str(entry.get("id") or "")
-    return bool(thread_id and thread_id in viewed_sessions)
-
-
-def _entry_state(entry, state, viewed_sessions=None, now=None):
-    viewed_sessions = viewed_sessions or {}
+def _entry_state(entry, state, now=None):
     now = now or datetime.now(timezone.utc)
     last_event = str(entry.get("last_event_msg_type") or "")
     if last_event in {"task_complete", "shutdown_complete"}:
-        if _is_viewed_complete(entry, viewed_sessions):
-            return "notLoaded"
         completed_at = _completion_time(entry)
         if completed_at != datetime.min.replace(tzinfo=timezone.utc):
             if completed_at.tzinfo is None:
@@ -294,13 +379,19 @@ def _entry_sort_time(entry):
     return _parse_time(entry.get("updated_at"))
 
 
-def build_sessions_payload(codex_home=None, limit=5, viewed_file=None, now=None):
+# Module-level mtime cache for the --watch loop.  Keyed by file path, maps to
+# (mtime, entry_dict).  Persists across calls so unchanged files are skipped.
+_mtime_cache = {}
+
+
+def build_sessions_payload(codex_home=None, limit=5, now=None):
     codex_home = Path(codex_home) if codex_home else _default_codex_home()
     state = _read_json_file(codex_home / ".codex-global-state.json")
-    viewed_sessions = _read_viewed_sessions(viewed_file)
     now_dt = now or datetime.now(timezone.utc)
     entries_by_id = {}
-    for entry in _read_session_index(codex_home) + _read_rollout_sessions(codex_home):
+    for entry in _read_session_index(codex_home) + _read_rollout_sessions(
+        codex_home, mtime_cache=_mtime_cache
+    ):
         thread_id = str(entry.get("id", ""))
         if not thread_id:
             continue
@@ -308,12 +399,12 @@ def build_sessions_payload(codex_home=None, limit=5, viewed_file=None, now=None)
         if existing is None or _parse_time(entry.get("updated_at")) >= _parse_time(existing.get("updated_at")):
             merged = dict(entry)
             if existing:
-                for key in ("last_event_msg_type", "rollout_mtime", "completed_at"):
+                for key in ("last_event_msg_type", "rollout_mtime", "completed_at", "last_user_at"):
                     if key not in merged and key in existing:
                         merged[key] = existing[key]
             entries_by_id[thread_id] = merged
         else:
-            for key in ("last_event_msg_type", "rollout_mtime", "completed_at"):
+            for key in ("last_event_msg_type", "rollout_mtime", "completed_at", "last_user_at"):
                 if key in entry and key not in existing:
                     existing[key] = entry[key]
 
@@ -324,13 +415,13 @@ def build_sessions_payload(codex_home=None, limit=5, viewed_file=None, now=None)
     )
     entries = sorted(
         entries,
-        key=lambda entry: _state_priority(_entry_state(entry, state, viewed_sessions, now_dt)),
+        key=lambda entry: _state_priority(_entry_state(entry, state, now_dt)),
     )[:limit]
 
     now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     sessions = []
     for entry in entries:
-        status_state = _entry_state(entry, state, viewed_sessions, now_dt)
+        status_state = _entry_state(entry, state, now_dt)
         workspace = _entry_workspace(entry, state)
         sessions.append(
             {
@@ -340,18 +431,38 @@ def build_sessions_payload(codex_home=None, limit=5, viewed_file=None, now=None)
                 "status_zh": STATE_LABELS_ZH[status_state],
                 "cwd": _workspace_name(workspace),
                 "updated_at": _format_time(entry.get("updated_at")) or now_text,
-                "detail": str(entry.get("detail") or ""),
+                "completed_at": _format_time(entry.get("completed_at")),
+                "last_user_at": _format_time(entry.get("last_user_at")),
             }
         )
 
     return {"updated_at": now_text, "sessions": sessions}
 
 
-def export_sessions(codex_home=None, output_file="sessions.json", limit=5, viewed_file=None):
+def _atomic_write(path, content):
+    """Write *content* to *path* atomically by using a temp file + os.replace."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Use a temp file in the same directory to ensure same-filesystem rename.
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(path.parent), prefix=".tmp_", suffix=path.suffix
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        os.replace(tmp_path, str(path))
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def export_sessions(codex_home=None, output_file="sessions.json", limit=5):
     output_path = Path(output_file)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = build_sessions_payload(codex_home=codex_home, limit=limit, viewed_file=viewed_file)
-    output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    payload = build_sessions_payload(codex_home=codex_home, limit=limit)
+    _atomic_write(output_path, json.dumps(payload, ensure_ascii=False, indent=2))
     return payload
 
 
@@ -360,19 +471,26 @@ def main():
     parser.add_argument("--codex-home", default=str(_default_codex_home()))
     parser.add_argument("--output", default="sessions.json")
     parser.add_argument("--limit", default=5, type=int)
-    parser.add_argument("--viewed-file", default="")
     parser.add_argument("--watch", action="store_true", help="Continuously refresh the output file.")
-    parser.add_argument("--interval", default=1.0, type=float, help="Refresh interval in seconds for --watch.")
+    parser.add_argument("--interval", default=5.0, type=float, help="Refresh interval in seconds for --watch.")
+    parser.add_argument(
+        "--log-every",
+        default=60,
+        type=int,
+        help="Print a log line every N export cycles (default: 60). Set to 1 to log every cycle.",
+    )
     args = parser.parse_args()
 
+    cycle = 0
     while True:
         payload = export_sessions(
             codex_home=args.codex_home,
             output_file=args.output,
             limit=args.limit,
-            viewed_file=args.viewed_file,
         )
-        print(f"Exported {len(payload['sessions'])} sessions to {args.output}")
+        cycle += 1
+        if args.log_every <= 1 or cycle % args.log_every == 0:
+            print(f"Exported {len(payload['sessions'])} sessions to {args.output}", flush=True)
         if not args.watch:
             break
         time.sleep(args.interval)

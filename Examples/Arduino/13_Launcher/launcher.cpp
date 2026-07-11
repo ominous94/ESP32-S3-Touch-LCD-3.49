@@ -8,6 +8,7 @@ static int pending_app_switch = -1;
 static bool pending_return_home = false;
 
 static lv_obj_t *g_bat_pct_label = NULL;
+static lv_obj_t *g_wifi_label = NULL;
 static lv_obj_t *g_bat_fill = NULL;
 static lv_obj_t *g_bat_body = NULL;
 static lv_obj_t *g_bat_terminal = NULL;
@@ -45,6 +46,8 @@ static void launcher_build_ui_locked(void)
 
   lv_obj_t *title = create_label(status_bar, "启动器", lv_color_hex(0xF7FAFC), -1);
   lv_obj_set_style_text_font(title, codex_font_20(), 0);
+
+  g_wifi_label = create_label(status_bar, "WiFi: --", lv_color_hex(0x8A99A5), 180);
 
   lv_obj_t *spacer = lv_obj_create(status_bar);
   lv_obj_set_size(spacer, 1, 1);
@@ -105,6 +108,7 @@ static void launcher_build_ui_locked(void)
 
   for (int i = 0; i < g_app_count; i++) {
     const LauncherApp *app = &g_app_registry[i];
+    if (app->hidden) continue;  // 隐藏的 app 不在主页网格显示（仍可由代码 switch 进入）
 
     lv_obj_t *cell = lv_obj_create(grid);
     lv_obj_set_size(cell, 120, 120);
@@ -269,6 +273,15 @@ void launcher_tick_current_app(void)
 {
   if (g_current_app != NULL && g_current_app->on_tick != NULL) {
     g_current_app->on_tick(g_current_app_scr);
+  }
+}
+
+void launcher_update_wifi_name(const char *text, lv_color_t color) {
+  if (g_wifi_label == NULL) return;
+  if (lvgl_port_lock(200)) {
+    lv_label_set_text(g_wifi_label, text);
+    lv_obj_set_style_text_color(g_wifi_label, color, 0);
+    lvgl_port_unlock();
   }
 }
 

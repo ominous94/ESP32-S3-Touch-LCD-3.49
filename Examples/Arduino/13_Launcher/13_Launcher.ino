@@ -14,6 +14,7 @@
 #include <WiFi.h>
 #include "apps/codex_status/app_codex_status.h"
 #include "apps/settings/app_settings.h"
+#include "src/audio_bsp/audio_bsp.h"
 
 #define CODEX_STATUS_ENABLE_SD_TTF 1
 
@@ -38,6 +39,8 @@ static const float BATTERY_VOLTAGE_MIN = 3.0f;
 static const uint32_t BATTERY_POLL_INTERVAL_MS = 1000;
 
 static uint32_t last_battery_poll_ms = 0;
+static uint32_t last_wifi_name_ms = 0;
+static const uint32_t WIFI_NAME_POLL_INTERVAL_MS = 1000;
 static bool is_power_hold_enabled = false;
 static bool is_sd_card_mounted = false;
 static esp_io_expander_handle_t io_expander = NULL;
@@ -116,6 +119,11 @@ static void tca9554_init(void)
   ESP_ERROR_CHECK(esp_io_expander_set_dir(io_expander, IO_EXPANDER_PIN_NUM_6, IO_EXPANDER_OUTPUT));
   ESP_ERROR_CHECK(esp_io_expander_set_level(io_expander, IO_EXPANDER_PIN_NUM_6, 1));
   is_power_hold_enabled = true;
+
+  // Pin 7 = ES8311 功放使能 (PA Enable)，拉高开启扬声器功放
+  ESP_ERROR_CHECK(esp_io_expander_set_dir(io_expander, IO_EXPANDER_PIN_NUM_7, IO_EXPANDER_OUTPUT));
+  ESP_ERROR_CHECK(esp_io_expander_set_level(io_expander, IO_EXPANDER_PIN_NUM_7, 1));
+  Serial.println("LAUNCHER pa_enabled pin7=high");
 }
 
 static void power_button_task(void *arg)
@@ -154,6 +162,22 @@ static void poll_battery()
   launcher_update_battery(volts, pct, charging);
 }
 
+static void poll_wifi_name()
+{
+  if (WiFi.getMode() & WIFI_AP) {
+    // 配网模式：设备自己开着 AP，没有"连接"的 WiFi
+    launcher_update_wifi_name("配网中", lv_color_hex(0xF0C86F));
+  } else if (WiFi.status() == WL_CONNECTED) {
+    String ssid = WiFi.SSID();
+    if (ssid.length() > 12) ssid = ssid.substring(0, 12);
+    String ip = WiFi.localIP().toString();
+    String text = ssid + " " + ip;
+    launcher_update_wifi_name(text.c_str(), lv_color_hex(0x78F0A4));
+  } else {
+    launcher_update_wifi_name("未连接", lv_color_hex(0xFF7E7E));
+  }
+}
+
 void setup()
 {
   Serial.begin(115200);
@@ -175,10 +199,21 @@ void setup()
 
   launcher_init();
 
-  codex_connect_wifi();
+  if (!codex_connect_wifi()) {
+    Serial.println("LAUNCHER wifi_failed_entering_config");
+    launcher_request_switch(app_idx::WIFI_CONFIG);
+  }
 
   button_Init();
   xTaskCreatePinnedToCore(power_button_task, "power_button_task", 4 * 1024, NULL, 2, NULL, 1);
+
+  // 初始化音频 codec（ES8311 DAC + 功放已在上面的 tca9554_init 中使能）
+  if (audio_bsp_init() == 0) {
+    audio_bsp_set_volume(settings_get_volume());
+    Serial.println("LAUNCHER audio_init ok");
+  } else {
+    Serial.println("LAUNCHER audio_init failed (non-fatal, continuing)");
+  }
 
   Serial.println("LAUNCHER ready");
 }
@@ -198,6 +233,10 @@ void loop()
   if (now_ms - last_battery_poll_ms >= BATTERY_POLL_INTERVAL_MS) {
     last_battery_poll_ms = now_ms;
     poll_battery();
+  }
+  if (now_ms - last_wifi_name_ms >= WIFI_NAME_POLL_INTERVAL_MS) {
+    last_wifi_name_ms = now_ms;
+    poll_wifi_name();
   }
 
   launcher_tick_current_app();
