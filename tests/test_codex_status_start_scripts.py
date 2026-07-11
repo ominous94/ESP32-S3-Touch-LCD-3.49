@@ -6,7 +6,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class CodexStatusStartScriptsTests(unittest.TestCase):
-    def test_powershell_launcher_starts_exporter_and_bridge(self):
+    def test_powershell_launcher_starts_app_server_adapter_and_bridge(self):
         script = ROOT / "tools" / "start_codex_status.ps1"
 
         self.assertTrue(script.is_file(), "tools/start_codex_status.ps1 is missing")
@@ -16,7 +16,8 @@ class CodexStatusStartScriptsTests(unittest.TestCase):
         self.assertIn("codex_status_bridge.py", text)
         self.assertIn("--watch", text)
         self.assertIn("--sessions-file", text)
-        self.assertIn("--viewed-file", text)
+        self.assertIn("--stale-after", text)
+        self.assertIn("CODEX_STATUS_TOKEN", text)
         self.assertIn("--host", text)
         self.assertIn("--port", text)
         self.assertIn("logs", text)

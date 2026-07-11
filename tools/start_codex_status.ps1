@@ -5,6 +5,8 @@
     [string]$CodexHome = "",
     [int]$Limit = 5,
     [double]$Interval = 5.0,
+    [double]$StaleAfter = 15.0,
+    [string]$Token = $env:CODEX_STATUS_TOKEN,
     [switch]$DryRun
 )
 
@@ -130,15 +132,19 @@ $bridgeArgs = @(
     "tools\codex_status_bridge.py",
     "--host", $HostAddress,
     "--port", [string]$Port,
-    "--sessions-file", $SessionsFile
+    "--sessions-file", $SessionsFile,
+    "--stale-after", [string]$StaleAfter
 )
+if ($Token) {
+    $bridgeArgs += @("--token", $Token)
+}
 
 Write-Host "Starting Codex Status services from $projectRoot"
 Write-Host "Sessions file: $SessionsFile"
 Write-Host "Logs: $logsDir"
 Write-Host ""
 
-Start-CodexStatusProcess -Name "Codex session exporter" -PidFile $exporterPidFile -OutLog $exporterOutLog -ErrLog $exporterErrLog -Arguments $exporterArgs -ExpectedScript "tools\export_codex_sessions.py"
+Start-CodexStatusProcess -Name "Codex App Server 状态适配器" -PidFile $exporterPidFile -OutLog $exporterOutLog -ErrLog $exporterErrLog -Arguments $exporterArgs -ExpectedScript "tools\export_codex_sessions.py"
 Start-CodexStatusProcess -Name "Codex status bridge" -PidFile $bridgePidFile -OutLog $bridgeOutLog -ErrLog $bridgeErrLog -Arguments $bridgeArgs -ExpectedScript "tools\codex_status_bridge.py"
 
 Write-Host ""
@@ -149,5 +155,8 @@ foreach ($address in Get-LocalIPv4Addresses) {
 }
 Write-Host ""
 Write-Host "Use one of the LAN URLs above for STATUS_URL on the ESP32."
+if ($Token) {
+    Write-Host "Bearer token authentication is enabled. Configure the same token in the ESP32 firmware."
+}
 Write-Host "To stop services later, stop the PIDs stored in logs\codex_status_*.pid."
 

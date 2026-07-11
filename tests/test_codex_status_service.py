@@ -8,6 +8,14 @@ from urllib.request import urlopen
 from tools.codex_status_service import CodexStatusService
 
 
+class FakeAppServer:
+    def refresh(self, limit=20):
+        return []
+
+    def close(self):
+        pass
+
+
 class CodexStatusServiceTests(unittest.TestCase):
     def test_service_starts_bridge_and_exporter_then_stops(self):
         with TemporaryDirectory() as temp_dir:
@@ -26,15 +34,14 @@ class CodexStatusServiceTests(unittest.TestCase):
                 encoding="utf-8",
             )
             sessions_file = root / "sessions.json"
-            viewed_file = root / "viewed_sessions.json"
             service = CodexStatusService(
                 project_root=root,
                 host="127.0.0.1",
                 port=0,
                 codex_home=codex_home,
                 sessions_file=sessions_file,
-                viewed_file=viewed_file,
                 interval=0.05,
+                app_server_factory=FakeAppServer,
             )
 
             service.start()

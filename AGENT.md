@@ -109,10 +109,13 @@ verify_codex_status.cmd --skip-compile --skip-upload
 
 ## Session State Detection
 
-- 会话"工作中/未加载"的判定在 `tools/export_codex_sessions.py` 的 `_is_active_entry`，**不要**回退到旧的"看 cwd 是否在 `active-workspace-roots` 里"逻辑——那是 Codex Desktop 的"打开的工作区"列表，不代表里面的会话还在跑，会把所有历史会话错标为 active。
-- 当前判定：`_read_rollout_sessions` 给每条 entry 记录 `last_event_msg_type` 和 `rollout_mtime`，`_is_active_entry` 要求最后一条 `event_msg` 不是 `task_complete`/`error`/`shutdown_complete`，且 rollout 文件 mtime 在 `ACTIVE_RECENT_SECONDS`（默认 120s）内。
-- 修改 exporter 后必须重启 exporter 进程（`logs/codex_status_exporter.pid`）才能生效；bridge 不需要重启，sketch 也不用重新部署。
-- 调试方法：直接 curl `http://127.0.0.1:8787/status`，对比 `sessions.json` 与 rollout 文件最后几行，看 active/notLoaded 是否符合预期。
+- 状态源优先使用 `tools/codex_app_server_status.py`：通过 Codex App Server 的 `thread/list` 获取稳定线程元数据，并处理 `thread/status/changed`、`turn/started`、`turn/completed` 实时事件。
+- Windows 上新启动的独立 App Server 不能共享 Codex Desktop 进程内的全部运行时状态。因此 `tools/export_codex_sessions.py` 会用 rollout 兼容层补齐 App Server 未返回或错误标为 `notLoaded` 的近期任务。
+- `/status` 顶层的 `source_status` 表示数据质量：`ok` 为 App Server 权威状态，`degraded` 为使用了 rollout 兼容层，`stale` 为快照超时，`error` 为快照缺失或损坏。不要把 `degraded`/`stale` 当作完全正常。
+- 每个 session 的 `status_source` 为 `appServer` 或 `rolloutFallback`，可用于定位某条状态的来源。
+- 修改状态适配器后必须重启 exporter 进程（`logs/codex_status_exporter.pid`）才能生效；bridge 不需要重启，除非修改了鉴权或 stale 配置。
+- 调试方法：直接请求 `http://127.0.0.1:8787/status`，同时检查 `source_status`、`status_source`、`source_age_ms` 与 `sessions.json`。
+- 可通过环境变量 `CODEX_STATUS_TOKEN` 为 bridge 开启 Bearer Token；开启后 ESP32 必须发送相同 token。
 
 ## Compile Lessons
 
@@ -140,7 +143,7 @@ ttf_font_20 = lv_tiny_ttf_create_file_ex(CODEX_STATUS_FONT_PATH, 20, LV_FONT_KER
 
 ## Known Limits
 
-- The bridge depends on the local exporter process to keep `sessions.json` fresh; running `tools/codex_status_bridge.py` alone without `--sessions-file` returns an empty session list.
+- The bridge depends on the local status adapter to keep `sessions.json` fresh; missing or invalid snapshots return `source_status=error`, and old snapshots return `source_status=stale` while retaining the last known sessions.
 - The custom Chinese fonts are intentionally subsetted. If new Chinese words are added to the UI or exported session data, regenerate or extend `lv_font_codex_zh_16.c` and `lv_font_codex_zh_20.c`; otherwise LVGL may show white boxes for missing glyphs.
 - The ESP32 JSON parser is a lightweight fixed-field parser, not a full JSON parser. It is suitable for the current bridge response shape only.
 - The display shows at most 5 sessions.
@@ -161,9 +164,8 @@ ttf_font_20 = lv_tiny_ttf_create_file_ex(CODEX_STATUS_FONT_PATH, 20, LV_FONT_KER
 
 ## Next Optimization Directions
 
-- Improve the live session pipeline.
-- Keep the current exporter-to-JSON approach and enrich the exported metadata.
-- Investigate whether Codex Desktop has a stable local thread store/API the bridge can read directly without an external exporter loop.
+- 在 Windows Codex Desktop 提供可连接的共享 App Server 端点后，移除 rollout 兼容层，改为纯 App Server 实时状态。
+- 将 `STATUS_URL` 和可选 Bearer Token 完整迁移到 ESP32 NVS 配置，避免重新编译固件。
 - Add paging or touch interaction for more than 5 sessions.
 - Add status sorting, for example active sessions first, then blocked/waiting, then completed.
 - Add per-state colors and concise Chinese labels: `active` = `工作中`, `notLoaded` = `未加载`, `complete` = `已完成`, `blocked` = `已阻塞`, fallback = `未知`.

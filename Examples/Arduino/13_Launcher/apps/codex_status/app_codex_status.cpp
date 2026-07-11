@@ -10,10 +10,10 @@
 #include <freertos/task.h>
 #include <freertos/semphr.h>
 
-/* ========== WiFi & Status Config ========== */
-static const char *WIFI_SSID = "HiWiFi_503";
-static const char *WIFI_PASSWORD = "ziroom0503";
+/* ========== Status Config ========== */
 static const char *STATUS_URL = "http://192.168.31.222:8787/status";
+/* 留空表示不鉴权。启用 bridge --token 后，应从 NVS 读取同一个 token。 */
+static const char *STATUS_TOKEN = "";
 
 /* ========== Constants ========== */
 static const uint32_t STATUS_POLL_INTERVAL_MS = 3000;
@@ -72,6 +72,9 @@ struct CodexSession {
 
 struct CodexStatus {
   String updated_at;
+  String source;
+  String source_status;
+  String source_error;
   int session_count;
   CodexSession sessions[5];
 };
@@ -131,6 +134,8 @@ static void log_status_snapshot(const char *connection, const CodexStatus &statu
   Serial.print("CODEX_STATUS ui_update");
   log_serial_field("connection", String(connection ? connection : ""));
   log_serial_field("sessions", status.session_count);
+  log_serial_field("source", status.source);
+  log_serial_field("source_status", status.source_status);
   log_serial_field("updated_at", status.updated_at.length() ? status.updated_at : "--");
   log_serial_field("heap", (int)ESP.getFreeHeap()); Serial.println();
   for (int i = 0; i < status.session_count; ++i) {
@@ -185,6 +190,9 @@ static int json_object_end(const String &json, int object_start) {
 static CodexStatus parse_status_json(const String &json) {
   CodexStatus status;
   status.updated_at = json_string_value(json, "updated_at");
+  status.source = json_string_value(json, "source");
+  status.source_status = json_string_value(json, "source_status");
+  status.source_error = json_string_value(json, "source_error");
   status.session_count = 0;
   int sessions_pos = json.indexOf("\"sessions\"");
   if (sessions_pos < 0) return status;
@@ -335,7 +343,9 @@ static int state_rank(const String &state) {
 
 static const void *image_for_status(const char *connection, const CodexStatus &status) {
   String conn(connection ? connection : "");
-  bool err = conn.indexOf("失败") >= 0 || conn.indexOf("错误") >= 0 || conn.indexOf("断开") >= 0;
+  bool err = conn.indexOf("失败") >= 0 || conn.indexOf("错误") >= 0 ||
+             conn.indexOf("断开") >= 0 || conn.indexOf("过期") >= 0 ||
+             conn.indexOf("超时") >= 0;
   if (err) return &codex_img_error;
   int best_rank = 99; String best_state = "notLoaded";
   for (int i = 0; i < status.session_count; ++i) {
@@ -536,13 +546,19 @@ static void codex_poll_task_func(void *arg) {
       HTTPClient http;
       http.setTimeout(1500);  // 大幅缩短超时
       http.begin(STATUS_URL);
+      if (strlen(STATUS_TOKEN) > 0) {
+        http.addHeader("Authorization", String("Bearer ") + STATUS_TOKEN);
+      }
       Serial.print("CODEX_STATUS http_get"); log_serial_field("url", String(STATUS_URL)); Serial.println();
       int code = http.GET();
       if (code == HTTP_CODE_OK) {
         String body = http.getString(); status = parse_status_json(body);
         Serial.print("CODEX_STATUS http_ok"); log_serial_field("code", code);
         log_serial_field("bytes", body.length()); log_serial_field("sessions", status.session_count); Serial.println();
-        connection = "已连接";
+        if (status.source_status == "stale") connection = "状态超时";
+        else if (status.source_status == "error") connection = "状态错误";
+        else if (status.source_status == "degraded") connection = "暂时本地";
+        else connection = "已连接";
       } else {
         status.session_count = 0; status.updated_at = String("HTTP ") + code;
         Serial.print("CODEX_STATUS http_error"); log_serial_field("code", code); Serial.println();
@@ -787,7 +803,9 @@ static void bind_home_status_locked(const char *connection, const CodexStatus &s
     }
   } else {
     String conn(connection ? connection : "");
-    bool err = conn.indexOf("失败") >= 0 || conn.indexOf("错误") >= 0 || conn.indexOf("断开") >= 0;
+    bool err = conn.indexOf("失败") >= 0 || conn.indexOf("错误") >= 0 ||
+               conn.indexOf("断开") >= 0 || conn.indexOf("过期") >= 0 ||
+               conn.indexOf("超时") >= 0;
     String empty_state = err ? conn : String("待机");
     lv_color_t color = err ? lv_color_hex(0xFF7E7E) : lv_color_hex(0xF0C86F);
     set_label_text(companion_state_label, empty_state);
@@ -868,8 +886,7 @@ static void update_status_ui(const char *connection, const CodexStatus &status) 
 bool codex_wifi_is_connected() { return g_wifi_connected; }
 
 bool codex_connect_wifi() {
-  // 暂时移除 fallback：NVS 无凭据直接返回 false，让开机自动进配网模式。
-  // WIFI_SSID/WIFI_PASSWORD 常量保留，测试完配网流程后可恢复 fallback。
+  // NVS 无凭据时直接返回 false，让开机自动进入配网模式。
   char nvs_ssid[33] = {0};
   char nvs_pwd[64]  = {0};
   if (!wifi_config_get_stored(nvs_ssid, sizeof(nvs_ssid), nvs_pwd, sizeof(nvs_pwd))) {
@@ -915,7 +932,18 @@ lv_obj_t *app_codex_create(void) {
   g_poll_mutex = xSemaphoreCreateMutex();
   g_poll_dirty = false;
   g_poll_task_should_exit = false;
-  xTaskCreatePinnedToCore(codex_poll_task_func, "codex_poll", 8192, NULL, 1, &g_poll_task_handle, 0);
+  if (g_poll_mutex == NULL) {
+    Serial.println("CODEX_STATUS poll_mutex_create_failed");
+    return g_app_scr;
+  }
+  BaseType_t task_result = xTaskCreatePinnedToCore(
+      codex_poll_task_func, "codex_poll", 8192, NULL, 1, &g_poll_task_handle, 0);
+  if (task_result != pdPASS) {
+    Serial.println("CODEX_STATUS poll_task_create_failed");
+    vSemaphoreDelete(g_poll_mutex);
+    g_poll_mutex = NULL;
+    g_poll_task_handle = NULL;
+  }
 
   return g_app_scr;
 }
@@ -930,9 +958,9 @@ void app_codex_destroy(lv_obj_t *scr) {
   if (g_poll_task_handle != NULL) {
     g_poll_task_should_exit = true;
 
-    // 3. 等待任务退出（最多 200ms）
+    // 3. 等待时间覆盖 1500ms HTTP 超时，避免在网络栈调用中强制删除任务。
     int wait_count = 0;
-    while (g_poll_task_handle != NULL && wait_count < 20) {
+    while (g_poll_task_handle != NULL && wait_count < 180) {
       vTaskDelay(pdMS_TO_TICKS(10));
       wait_count++;
     }

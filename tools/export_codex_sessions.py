@@ -6,6 +6,19 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+try:
+    from tools.codex_app_server_status import (
+        CodexAppServerError,
+        CodexAppServerStatus,
+        app_server_thread_to_entry,
+    )
+except ModuleNotFoundError:  # Direct execution: python tools/export_codex_sessions.py
+    from codex_app_server_status import (
+        CodexAppServerError,
+        CodexAppServerStatus,
+        app_server_thread_to_entry,
+    )
+
 
 STATE_LABELS_ZH = {
     "active": "\u5de5\u4f5c\u4e2d",
@@ -384,7 +397,25 @@ def _entry_sort_time(entry):
 _mtime_cache = {}
 
 
-def build_sessions_payload(codex_home=None, limit=5, now=None):
+def _effective_entry_state(entry, state, now):
+    legacy_state = _entry_state(entry, state, now)
+    app_server_state = str(entry.get("app_server_state") or "")
+    if app_server_state and app_server_state != "notLoaded":
+        return app_server_state, "appServer"
+    if legacy_state != "notLoaded":
+        return legacy_state, "rolloutFallback"
+    if app_server_state:
+        return app_server_state, "appServer"
+    return legacy_state, "rolloutFallback"
+
+
+def build_sessions_payload(
+    codex_home=None,
+    limit=5,
+    now=None,
+    app_server_threads=None,
+    app_server_error="",
+):
     codex_home = Path(codex_home) if codex_home else _default_codex_home()
     state = _read_json_file(codex_home / ".codex-global-state.json")
     now_dt = now or datetime.now(timezone.utc)
@@ -408,6 +439,21 @@ def build_sessions_payload(codex_home=None, limit=5, now=None):
                 if key in entry and key not in existing:
                     existing[key] = entry[key]
 
+    if app_server_threads is not None:
+        for thread in app_server_threads:
+            app_entry = app_server_thread_to_entry(thread)
+            thread_id = str(app_entry.get("id") or "")
+            if not thread_id:
+                continue
+            existing = entries_by_id.get(thread_id, {})
+            merged = dict(existing)
+            for key, value in app_entry.items():
+                if value not in (None, "", []):
+                    merged[key] = value
+            merged["id"] = thread_id
+            merged["has_app_server"] = True
+            entries_by_id[thread_id] = merged
+
     entries = sorted(
         entries_by_id.values(),
         key=_entry_sort_time,
@@ -415,28 +461,55 @@ def build_sessions_payload(codex_home=None, limit=5, now=None):
     )
     entries = sorted(
         entries,
-        key=lambda entry: _state_priority(_entry_state(entry, state, now_dt)),
+        key=lambda entry: _state_priority(_effective_entry_state(entry, state, now_dt)[0]),
     )[:limit]
 
     now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     sessions = []
+    used_fallback = False
     for entry in entries:
-        status_state = _entry_state(entry, state, now_dt)
+        status_state, status_source = _effective_entry_state(entry, state, now_dt)
+        used_fallback = used_fallback or status_source == "rolloutFallback"
         workspace = _entry_workspace(entry, state)
+        status_zh = STATE_LABELS_ZH[status_state]
+        if status_source == "appServer" and entry.get("app_server_status_zh"):
+            status_zh = str(entry["app_server_status_zh"])
         sessions.append(
             {
                 "id": str(entry.get("id") or ""),
                 "title": _screen_title(entry.get("thread_name")),
                 "state": status_state,
-                "status_zh": STATE_LABELS_ZH[status_state],
+                "status_zh": status_zh,
                 "cwd": _workspace_name(workspace),
                 "updated_at": _format_time(entry.get("updated_at")) or now_text,
                 "completed_at": _format_time(entry.get("completed_at")),
                 "last_user_at": _format_time(entry.get("last_user_at")),
+                "status_source": status_source,
             }
         )
 
-    return {"updated_at": now_text, "sessions": sessions}
+    if app_server_threads is None:
+        source = "rolloutFallback"
+        source_status = "degraded"
+    elif app_server_error and not sessions:
+        source = "unavailable"
+        source_status = "error"
+    elif app_server_error:
+        source = "appServer+rolloutFallback"
+        source_status = "degraded"
+    elif used_fallback:
+        source = "appServer+rolloutFallback"
+        source_status = "degraded"
+    else:
+        source = "appServer"
+        source_status = "ok"
+    return {
+        "updated_at": now_text,
+        "source": source,
+        "source_status": source_status,
+        "source_error": str(app_server_error or ""),
+        "sessions": sessions,
+    }
 
 
 def _atomic_write(path, content):
@@ -459,9 +532,20 @@ def _atomic_write(path, content):
         raise
 
 
-def export_sessions(codex_home=None, output_file="sessions.json", limit=5):
+def export_sessions(
+    codex_home=None,
+    output_file="sessions.json",
+    limit=5,
+    app_server_threads=None,
+    app_server_error="",
+):
     output_path = Path(output_file)
-    payload = build_sessions_payload(codex_home=codex_home, limit=limit)
+    payload = build_sessions_payload(
+        codex_home=codex_home,
+        limit=limit,
+        app_server_threads=app_server_threads,
+        app_server_error=app_server_error,
+    )
     _atomic_write(output_path, json.dumps(payload, ensure_ascii=False, indent=2))
     return payload
 
@@ -474,6 +558,11 @@ def main():
     parser.add_argument("--watch", action="store_true", help="Continuously refresh the output file.")
     parser.add_argument("--interval", default=5.0, type=float, help="Refresh interval in seconds for --watch.")
     parser.add_argument(
+        "--legacy-only",
+        action="store_true",
+        help="Disable Codex App Server and use rollout compatibility mode only.",
+    )
+    parser.add_argument(
         "--log-every",
         default=60,
         type=int,
@@ -481,19 +570,40 @@ def main():
     )
     args = parser.parse_args()
 
+    app_server = None if args.legacy_only else CodexAppServerStatus()
     cycle = 0
-    while True:
-        payload = export_sessions(
-            codex_home=args.codex_home,
-            output_file=args.output,
-            limit=args.limit,
-        )
-        cycle += 1
-        if args.log_every <= 1 or cycle % args.log_every == 0:
-            print(f"Exported {len(payload['sessions'])} sessions to {args.output}", flush=True)
-        if not args.watch:
-            break
-        time.sleep(args.interval)
+    try:
+        while True:
+            app_server_threads = None
+            app_server_error = ""
+            if app_server is not None:
+                try:
+                    app_server_threads = app_server.refresh(limit=max(args.limit * 4, 20))
+                except CodexAppServerError as exc:
+                    app_server_error = str(exc)
+                    app_server_threads = []
+                    app_server.close()
+            payload = export_sessions(
+                codex_home=args.codex_home,
+                output_file=args.output,
+                limit=args.limit,
+                app_server_threads=app_server_threads,
+                app_server_error=app_server_error,
+            )
+            cycle += 1
+            if args.log_every <= 1 or cycle % args.log_every == 0:
+                print(
+                    f"Exported {len(payload['sessions'])} sessions "
+                    f"source={payload['source']} status={payload['source_status']} "
+                    f"to {args.output}",
+                    flush=True,
+                )
+            if not args.watch:
+                break
+            time.sleep(args.interval)
+    finally:
+        if app_server is not None:
+            app_server.close()
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ import sys
 import threading
 from pathlib import Path
 
+from tools.codex_app_server_status import CodexAppServerError, CodexAppServerStatus
 from tools.codex_status_bridge import StatusServer
 from tools.export_codex_sessions import export_sessions
 
@@ -17,6 +18,9 @@ class CodexStatusService:
         sessions_file=None,
         limit=5,
         interval=5.0,
+        stale_after=15.0,
+        token="",
+        app_server_factory=CodexAppServerStatus,
         log_callback=None,
     ):
         self.project_root = Path(project_root) if project_root else default_project_root()
@@ -26,6 +30,9 @@ class CodexStatusService:
         self.sessions_file = Path(sessions_file) if sessions_file else self.project_root / "sessions.json"
         self.limit = int(limit)
         self.interval = float(interval)
+        self.stale_after = float(stale_after)
+        self.token = str(token or "")
+        self.app_server_factory = app_server_factory
         self.log_callback = log_callback
         self._stop_event = threading.Event()
         self._exporter_thread = None
@@ -69,6 +76,8 @@ class CodexStatusService:
             host=self.host,
             port=self.port,
             sessions_file=str(self.sessions_file),
+            stale_after=self.stale_after,
+            token=self.token,
         )
         self.port = self._server.port
         self._exporter_thread = threading.Thread(target=self._run_exporter, name="codex-status-exporter", daemon=True)
@@ -100,19 +109,35 @@ class CodexStatusService:
         self._log("服务已停止。")
 
     def _run_exporter(self):
-        while not self._stop_event.is_set():
-            try:
-                payload = export_sessions(
-                    codex_home=self.codex_home,
-                    output_file=self.sessions_file,
-                    limit=self.limit,
-                )
-                self._export_cycle += 1
-                if self._export_cycle % 60 == 0:
-                    self._log(f"已刷新 sessions：{len(payload['sessions'])} 个会话")
-            except Exception as exc:
-                self._set_error(f"刷新 sessions 失败：{exc}")
-            self._stop_event.wait(self.interval)
+        app_server = self.app_server_factory()
+        try:
+            while not self._stop_event.is_set():
+                app_server_threads = []
+                app_server_error = ""
+                try:
+                    app_server_threads = app_server.refresh(limit=max(self.limit * 4, 20))
+                except CodexAppServerError as exc:
+                    app_server_error = str(exc)
+                    app_server.close()
+                try:
+                    payload = export_sessions(
+                        codex_home=self.codex_home,
+                        output_file=self.sessions_file,
+                        limit=self.limit,
+                        app_server_threads=app_server_threads,
+                        app_server_error=app_server_error,
+                    )
+                    self._export_cycle += 1
+                    if self._export_cycle % 60 == 0 or app_server_error:
+                        self._log(
+                            f"已刷新 sessions：{len(payload['sessions'])} 个会话，"
+                            f"来源={payload['source']} 状态={payload['source_status']}"
+                        )
+                except Exception as exc:
+                    self._set_error(f"刷新 sessions 失败：{exc}")
+                self._stop_event.wait(self.interval)
+        finally:
+            app_server.close()
 
     def _run_bridge(self):
         try:

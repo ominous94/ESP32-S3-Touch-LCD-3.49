@@ -149,61 +149,30 @@ class ExportCodexSessionsTests(unittest.TestCase):
         self.assertEqual(payload["sessions"][0]["state"], "complete")
         self.assertEqual(payload["sessions"][0]["status_zh"], DONE_ZH)
 
-    def test_viewed_complete_session_is_exported_as_not_loaded(self):
+    def test_app_server_active_state_is_preferred(self):
         with TemporaryDirectory() as temp_dir:
             codex_home = Path(temp_dir) / ".codex"
-            rollout_dir = codex_home / "sessions" / "2026" / "06" / "14"
-            viewed_file = Path(temp_dir) / "viewed_sessions.json"
-            rollout_dir.mkdir(parents=True)
-            (rollout_dir / "rollout-2026-06-14T09-00-00-thread-viewed.jsonl").write_text(
-                "\n".join(
-                    [
-                        json.dumps(
-                            {
-                                "timestamp": "2026-06-14T09:00:00.000Z",
-                                "type": "session_meta",
-                                "payload": {"id": "thread-viewed"},
-                            },
-                            ensure_ascii=False,
-                        ),
-                        json.dumps(
-                            {
-                                "timestamp": "2026-06-14T09:01:00.000Z",
-                                "type": "response_item",
-                                "payload": {
-                                    "type": "message",
-                                    "role": "user",
-                                    "content": [{"type": "input_text", "text": STATUS_TITLE}],
-                                },
-                            },
-                            ensure_ascii=False,
-                        ),
-                        json.dumps(
-                            {
-                                "timestamp": "2026-06-14T09:02:00.000Z",
-                                "type": "event_msg",
-                                "payload": {"type": "task_complete"},
-                            },
-                            ensure_ascii=False,
-                        ),
-                    ]
-                ),
-                encoding="utf-8",
-            )
-            viewed_file.write_text(
-                json.dumps({"thread-viewed": {"viewed_at": "2026-06-14 09:03:00"}}),
-                encoding="utf-8",
-            )
+            codex_home.mkdir()
 
             payload = build_sessions_payload(
                 codex_home=codex_home,
-                viewed_file=viewed_file,
                 limit=1,
+                app_server_threads=[
+                    {
+                        "id": "thread-app-server",
+                        "name": STATUS_TITLE,
+                        "cwd": str(codex_home.parent),
+                        "updatedAt": 1781427600,
+                        "status": {"type": "active", "activeFlags": []},
+                    }
+                ],
             )
 
-        self.assertEqual(payload["sessions"][0]["id"], "thread-viewed")
-        self.assertEqual(payload["sessions"][0]["state"], "notLoaded")
-        self.assertEqual(payload["sessions"][0]["status_zh"], IDLE_ZH)
+        self.assertEqual(payload["source"], "appServer")
+        self.assertEqual(payload["source_status"], "ok")
+        self.assertEqual(payload["sessions"][0]["id"], "thread-app-server")
+        self.assertEqual(payload["sessions"][0]["state"], "active")
+        self.assertEqual(payload["sessions"][0]["status_source"], "appServer")
 
     def test_complete_session_older_than_ten_minutes_is_exported_as_not_loaded(self):
         with TemporaryDirectory() as temp_dir:
@@ -459,7 +428,7 @@ class ExportCodexSessionsTests(unittest.TestCase):
             {session["state"] for session in payload["sessions"][1:]},
         )
 
-    def test_build_sessions_payload_exports_recent_conversation_detail(self):
+    def test_recent_rollout_is_explicitly_marked_as_fallback(self):
         with TemporaryDirectory() as temp_dir:
             codex_home = Path(temp_dir) / ".codex"
             rollout_dir = codex_home / "sessions" / "2026" / "06" / "14"
@@ -507,12 +476,14 @@ class ExportCodexSessionsTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            payload = build_sessions_payload(codex_home=codex_home, limit=1)
+            payload = build_sessions_payload(
+                codex_home=codex_home,
+                limit=1,
+                app_server_threads=[],
+            )
 
-        detail = payload["sessions"][0]["detail"]
-        self.assertIn(USER_DETAIL, detail)
-        self.assertIn(ASSISTANT_DETAIL, detail)
-        self.assertNotIn("updated_at", detail)
+        self.assertEqual(payload["source_status"], "degraded")
+        self.assertEqual(payload["sessions"][0]["status_source"], "rolloutFallback")
 
 
 if __name__ == "__main__":
