@@ -111,7 +111,7 @@ static void launcher_build_ui_locked(void)
     if (app->hidden) continue;  // 隐藏的 app 不在主页网格显示（仍可由代码 switch 进入）
 
     lv_obj_t *cell = lv_obj_create(grid);
-    lv_obj_set_size(cell, 120, 120);
+    lv_obj_set_size(cell, 112, 112);
     lv_obj_clear_flag(cell, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(cell, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_style_bg_color(cell, lv_color_hex(0x1D252C), 0);

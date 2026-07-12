@@ -5,6 +5,7 @@
 #include "apps/codex_status/app_codex_status.h"
 #include "apps/imu_test/app_imu_test.h"
 #include "apps/ball_roll/app_ball_roll.h"
+#include "apps/ocean_water/app_ocean_water.h"
 #include "apps/sd_browser/app_sd_browser.h"
 #include "apps/settings/app_settings.h"
 #include "apps/wifi_config/app_wifi_config.h"
@@ -37,6 +38,15 @@ const LauncherApp g_app_registry[] = {
     .create = app_ball_roll_create,
     .destroy = app_ball_roll_destroy,
     .on_tick = app_ball_roll_tick,
+  },
+  {
+    .name_zh = "电子海洋",
+    .name_en = "Ocean",
+    .icon_img = NULL,
+    .icon_char = "O",
+    .create = app_ocean_water_create,
+    .destroy = app_ocean_water_destroy,
+    .on_tick = app_ocean_water_tick,
   },
   {
     .name_zh = "设置",

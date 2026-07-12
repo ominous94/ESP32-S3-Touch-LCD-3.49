@@ -12,6 +12,7 @@
 #include "esp_lcd_panel_io.h"
 #include "src/axs15231b/esp_lcd_axs15231b.h"
 #include "i2c_bsp.h"
+#include <string.h>
 
 static const char *TAG = "lvgl_port";
 static SemaphoreHandle_t lvgl_mux = NULL;
@@ -19,6 +20,8 @@ static SemaphoreHandle_t lvgl_mux = NULL;
 static uint16_t *trans_buf_1 = NULL;
 static uint8_t *lvgl_dest = NULL;
 static SemaphoreHandle_t flush_done_semaphore;
+static esp_lcd_panel_handle_t s_panel_handle = NULL;
+static volatile bool s_direct_mode = false;
 
 /* Flush timing: log every Nth flush so the user can see the average wall time. */
 static uint32_t s_flush_seq = 0;
@@ -32,6 +35,93 @@ static volatile int  s_crop_y_max   = 0;
 void lvgl_port_set_crop(bool enabled, int y_max) {
   s_crop_enabled = enabled;
   s_crop_y_max   = y_max;
+}
+
+bool lvgl_port_direct_mode_begin(void)
+{
+  lv_display_t *disp = lv_display_get_default();
+  if (disp == NULL || s_panel_handle == NULL || trans_buf_1 == NULL || flush_done_semaphore == NULL) {
+    return false;
+  }
+
+  lv_timer_t *refr_timer = lv_display_get_refr_timer(disp);
+  if (refr_timer == NULL) return false;
+  lv_timer_pause(refr_timer);
+  s_direct_mode = true;
+  return true;
+}
+
+void lvgl_port_direct_mode_end(void)
+{
+  s_direct_mode = false;
+  lv_display_t *disp = lv_display_get_default();
+  if (disp == NULL) return;
+  lv_timer_t *refr_timer = lv_display_get_refr_timer(disp);
+  if (refr_timer != NULL) {
+    lv_timer_ready(refr_timer);
+    lv_timer_resume(refr_timer);
+  }
+}
+
+static inline uint16_t rgb565_swap(uint16_t color)
+{
+  return (uint16_t)((color << 8) | (color >> 8));
+}
+
+bool lvgl_port_direct_draw_grid(const uint16_t *colors,
+                                int grid_w, int grid_h,
+                                int cell_size, int cell_draw_size,
+                                int x_offset, uint32_t *elapsed_us)
+{
+  if (!s_direct_mode || colors == NULL || s_panel_handle == NULL || trans_buf_1 == NULL) return false;
+  if (grid_w <= 0 || grid_h <= 0 || cell_size <= 0 || cell_draw_size <= 0 ||
+      cell_draw_size > cell_size || grid_h * cell_size != EXAMPLE_LCD_V_RES ||
+      x_offset < 0 || x_offset + grid_w * cell_size > EXAMPLE_LCD_H_RES) return false;
+
+  const int rows_per_chunk = LVGL_DMA_BUFF_LEN / (EXAMPLE_LCD_H_RES * sizeof(uint16_t));
+  const int chunk_count = EXAMPLE_LCD_V_RES / rows_per_chunk;
+  uint16_t row_pattern[EXAMPLE_LCD_H_RES];
+  int cached_grid_y = -1;
+  uint64_t start_us = esp_timer_get_time();
+
+  xSemaphoreGive(flush_done_semaphore);
+  for (int chunk = 0; chunk < chunk_count; ++chunk) {
+    if (xSemaphoreTake(flush_done_semaphore, portMAX_DELAY) != pdTRUE) return false;
+
+    const int y_start = chunk * rows_per_chunk;
+    for (int local_y = 0; local_y < rows_per_chunk; ++local_y) {
+      const int screen_y = y_start + local_y;
+      uint16_t *dest_row = trans_buf_1 + local_y * EXAMPLE_LCD_H_RES;
+      const int grid_y = screen_y / cell_size;
+      const int within_cell_y = screen_y % cell_size;
+
+      if (within_cell_y >= cell_draw_size) {
+        memset(dest_row, 0, EXAMPLE_LCD_H_RES * sizeof(uint16_t));
+        continue;
+      }
+
+      if (cached_grid_y != grid_y) {
+        memset(row_pattern, 0, sizeof(row_pattern));
+        for (int grid_x = 0; grid_x < grid_w; ++grid_x) {
+          uint16_t color = rgb565_swap(colors[grid_y * grid_w + grid_x]);
+          uint16_t *cell = row_pattern + x_offset + grid_x * cell_size;
+          for (int px = 0; px < cell_draw_size; ++px) cell[px] = color;
+        }
+        cached_grid_y = grid_y;
+      }
+      memcpy(dest_row, row_pattern, sizeof(row_pattern));
+    }
+
+    esp_err_t err = esp_lcd_panel_draw_bitmap(s_panel_handle,
+                                               0, y_start,
+                                               EXAMPLE_LCD_H_RES, y_start + rows_per_chunk,
+                                               trans_buf_1);
+    if (err != ESP_OK) return false;
+  }
+  if (xSemaphoreTake(flush_done_semaphore, portMAX_DELAY) != pdTRUE) return false;
+
+  if (elapsed_us != NULL) *elapsed_us = (uint32_t)(esp_timer_get_time() - start_us);
+  return true;
 }
 
 #define LCD_BIT_PER_PIXEL 16
@@ -59,6 +149,10 @@ static void example_increase_lvgl_tick(void *arg)
 
 static void example_lvgl_flush_cb(lv_display_t * disp, const lv_area_t * area, uint8_t * color_p)
 {
+  if (s_direct_mode) {
+    lv_disp_flush_ready(disp);
+    return;
+  }
   esp_lcd_panel_handle_t panel_handle = (esp_lcd_panel_handle_t)lv_display_get_user_data(disp);
   lv_draw_sw_rgb565_swap(color_p, lv_area_get_width(area) * lv_area_get_height(area));
   uint64_t t0 = esp_timer_get_time();
@@ -261,6 +355,7 @@ void lvgl_port_init(void)
 
   ESP_LOGI(TAG, "Install panel driver");
   ESP_ERROR_CHECK(esp_lcd_new_panel_axs15231b(panel_io, &panel_config, &panel));
+  s_panel_handle = panel;
     
 	ESP_ERROR_CHECK(gpio_set_level(EXAMPLE_PIN_NUM_LCD_RST,1));
   vTaskDelay(pdMS_TO_TICKS(30));

@@ -44,6 +44,7 @@ namespace app_idx {
   constexpr int CODEX_STATUS = 0;
   constexpr int IMU_TEST     = 1;
   constexpr int BALL_ROLL    = 2;
-  constexpr int SETTINGS     = 3;
-  constexpr int WIFI_CONFIG  = 4;
+  constexpr int OCEAN_WATER  = 3;
+  constexpr int SETTINGS     = 4;
+  constexpr int WIFI_CONFIG  = 5;
 }
