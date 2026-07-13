@@ -135,7 +135,8 @@ static void launcher_build_ui_locked(void)
     if (app->icon_img != NULL) {
       lv_obj_t *img = lv_image_create(cell);
       lv_image_set_src(img, app->icon_img);
-      lv_image_set_scale(img, 128);
+      lv_image_set_scale(img, app->icon_scale > 0 ? app->icon_scale : 128);
+      lv_obj_set_style_image_recolor(img, lv_color_hex(0x74B9FF), 0);
       lv_obj_set_size(img, 48, 48);
       lv_obj_align(img, LV_ALIGN_CENTER, 0, -12);
     } else {

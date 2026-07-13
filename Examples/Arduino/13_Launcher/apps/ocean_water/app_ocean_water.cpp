@@ -98,7 +98,7 @@ static bool ocean_read_gravity(float *gx, float *gy)
   float ax = (float)raw_x * OCEAN_ACCEL_SCALE;
   float ay = (float)raw_y * OCEAN_ACCEL_SCALE;
 
-  // QMI8658 轴到 rotation 0 屏幕坐标的映射，与“重力滚球”应用保持一致。
+  // QMI8658 轴到 rotation 0 屏幕坐标的映射。
   *gx = ay;
   *gy = ax;
   return true;

@@ -10,6 +10,7 @@ typedef struct {
   const char *name_en;
   const void *icon_img;
   const char *icon_char;
+  uint16_t icon_scale;
   lv_obj_t *(*create)(void);
   void (*destroy)(lv_obj_t *scr);
   void (*on_tick)(lv_obj_t *scr);
@@ -43,8 +44,7 @@ const lv_font_t *codex_font_20(void);
 namespace app_idx {
   constexpr int CODEX_STATUS = 0;
   constexpr int IMU_TEST     = 1;
-  constexpr int BALL_ROLL    = 2;
-  constexpr int OCEAN_WATER  = 3;
-  constexpr int SETTINGS     = 4;
-  constexpr int WIFI_CONFIG  = 5;
+  constexpr int OCEAN_WATER  = 2;
+  constexpr int SETTINGS     = 3;
+  constexpr int WIFI_CONFIG  = 4;
 }
