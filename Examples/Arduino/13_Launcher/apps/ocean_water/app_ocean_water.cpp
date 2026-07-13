@@ -2,6 +2,7 @@
 #include "ocean_flip.h"
 #include "i2c_bsp.h"
 #include "esp_heap_caps.h"
+#include "esp_random.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -16,6 +17,12 @@ constexpr uint32_t OCEAN_FRAME_MS = 33;
 constexpr float OCEAN_ACCEL_SCALE = 4.0f / 32768.0f;
 constexpr float OCEAN_ACCEL_ALPHA = 0.30f;
 constexpr uint32_t OCEAN_PROFILE_FRAMES = 120;
+constexpr uint32_t OCEAN_IDLE_WAVE_DELAY_MS = 10000;
+constexpr uint32_t OCEAN_IDLE_WAVE_GAP_MIN_MS = 4000;
+constexpr uint32_t OCEAN_IDLE_WAVE_GAP_MAX_MS = 9000;
+constexpr float OCEAN_IDLE_WAVE_IMPULSE_MIN = 4.25f;
+constexpr float OCEAN_IDLE_WAVE_IMPULSE_MAX = 6.75f;
+constexpr float OCEAN_STILL_ACCEL_DELTA_G = 0.055f;
 
 struct OceanConfig {
   const char *mode_name;
@@ -34,6 +41,15 @@ struct OceanStats {
   uint64_t imu_us;
   uint64_t flip_us;
   uint64_t draw_us;
+};
+
+struct OceanIdleWaveState {
+  bool motion_reference_ready;
+  bool idle_ready;
+  float last_accel[3];
+  float still_accel[3];
+  uint32_t still_since_ms;
+  uint32_t next_wave_ms;
 };
 
 static const OceanConfig OCEAN_CONFIG_STANDARD = {
@@ -86,7 +102,7 @@ static bool ocean_imu_init()
   return true;
 }
 
-static bool ocean_read_gravity(float *gx, float *gy)
+static bool ocean_read_gravity(float *gx, float *gy, float *gz)
 {
   uint8_t status = 0;
   if (!imu_read(OCEAN_QMI_REG_STATUS0, &status, 1) || !(status & 0x01)) return false;
@@ -95,12 +111,92 @@ static bool ocean_read_gravity(float *gx, float *gy)
   if (!imu_read(OCEAN_QMI_REG_AX_L, data, sizeof(data))) return false;
   int16_t raw_x = (int16_t)(((uint16_t)data[1] << 8) | data[0]);
   int16_t raw_y = (int16_t)(((uint16_t)data[3] << 8) | data[2]);
+  int16_t raw_z = (int16_t)(((uint16_t)data[5] << 8) | data[4]);
   float ax = (float)raw_x * OCEAN_ACCEL_SCALE;
   float ay = (float)raw_y * OCEAN_ACCEL_SCALE;
+  float az = (float)raw_z * OCEAN_ACCEL_SCALE;
 
   // QMI8658 轴到 rotation 0 屏幕坐标的映射。
   *gx = ay;
   *gy = ax;
+  *gz = az;
+  return true;
+}
+
+static float random_float(float min_value, float max_value)
+{
+  const float unit = (float)esp_random() / (float)UINT32_MAX;
+  return min_value + (max_value - min_value) * unit;
+}
+
+static uint32_t random_ms(uint32_t min_value, uint32_t max_value)
+{
+  if (max_value <= min_value) return min_value;
+  return min_value + esp_random() % (max_value - min_value + 1U);
+}
+
+static bool time_reached(uint32_t now_ms, uint32_t target_ms)
+{
+  return (int32_t)(now_ms - target_ms) >= 0;
+}
+
+static void reset_idle_wave(OceanIdleWaveState *state, uint32_t now_ms,
+                            float ax, float ay, float az)
+{
+  state->motion_reference_ready = true;
+  state->idle_ready = false;
+  state->last_accel[0] = state->still_accel[0] = ax;
+  state->last_accel[1] = state->still_accel[1] = ay;
+  state->last_accel[2] = state->still_accel[2] = az;
+  state->still_since_ms = now_ms;
+  state->next_wave_ms = 0;
+}
+
+static bool update_stationary_state(OceanIdleWaveState *state, uint32_t now_ms,
+                                    float ax, float ay, float az)
+{
+  if (!state->motion_reference_ready) {
+    reset_idle_wave(state, now_ms, ax, ay, az);
+    return true;
+  }
+
+  const float sample_dx = ax - state->last_accel[0];
+  const float sample_dy = ay - state->last_accel[1];
+  const float sample_dz = az - state->last_accel[2];
+  const float anchor_dx = ax - state->still_accel[0];
+  const float anchor_dy = ay - state->still_accel[1];
+  const float anchor_dz = az - state->still_accel[2];
+  const float threshold_sq = OCEAN_STILL_ACCEL_DELTA_G * OCEAN_STILL_ACCEL_DELTA_G;
+  const float sample_delta_sq = sample_dx * sample_dx + sample_dy * sample_dy + sample_dz * sample_dz;
+  const float anchor_delta_sq = anchor_dx * anchor_dx + anchor_dy * anchor_dy + anchor_dz * anchor_dz;
+
+  state->last_accel[0] = ax;
+  state->last_accel[1] = ay;
+  state->last_accel[2] = az;
+  if (sample_delta_sq > threshold_sq || anchor_delta_sq > threshold_sq) {
+    reset_idle_wave(state, now_ms, ax, ay, az);
+    return false;
+  }
+  return true;
+}
+
+static bool should_start_idle_wave(OceanIdleWaveState *state, uint32_t now_ms)
+{
+  if (!state->motion_reference_ready) return false;
+
+  if (!state->idle_ready) {
+    if ((uint32_t)(now_ms - state->still_since_ms) < OCEAN_IDLE_WAVE_DELAY_MS) return false;
+    state->idle_ready = true;
+    const uint32_t gap_ms = random_ms(OCEAN_IDLE_WAVE_GAP_MIN_MS,
+                                      OCEAN_IDLE_WAVE_GAP_MAX_MS);
+    state->next_wave_ms = now_ms + gap_ms;
+    return true;
+  }
+
+  if (!time_reached(now_ms, state->next_wave_ms)) return false;
+  const uint32_t gap_ms = random_ms(OCEAN_IDLE_WAVE_GAP_MIN_MS,
+                                    OCEAN_IDLE_WAVE_GAP_MAX_MS);
+  state->next_wave_ms = now_ms + gap_ms;
   return true;
 }
 
@@ -195,6 +291,7 @@ static void ocean_sim_task(void *arg)
   float filtered_gx = 0.0f;
   float filtered_gy = 1.0f;
   bool gravity_initialized = false;
+  OceanIdleWaveState idle_wave = {};
   memset(&g_stats, 0, sizeof(g_stats));
   Serial.println(imu_ready ? "OCEAN imu_ready chip=QMI8658" : "OCEAN imu_failed fallback=synthetic");
 
@@ -215,10 +312,13 @@ static void ocean_sim_task(void *arg)
       uint64_t stage_started_us = profile_this_frame ? esp_timer_get_time() : 0;
       float gx = filtered_gx;
       float gy = filtered_gy;
+      const uint32_t now_ms = millis();
       if (imu_ready) {
         float measured_gx = 0.0f;
         float measured_gy = 0.0f;
-        if (ocean_read_gravity(&measured_gx, &measured_gy)) {
+        float measured_gz = 0.0f;
+        if (ocean_read_gravity(&measured_gx, &measured_gy, &measured_gz)) {
+          update_stationary_state(&idle_wave, now_ms, measured_gx, measured_gy, measured_gz);
           if (!gravity_initialized) {
             filtered_gx = measured_gx;
             filtered_gy = measured_gy;
@@ -231,9 +331,18 @@ static void ocean_sim_task(void *arg)
           gy = filtered_gy;
         }
       } else {
-        const float seconds = (float)millis() * 0.001f;
-        gx = sinf(seconds * 0.72f) * 0.34f;
+        if (!idle_wave.motion_reference_ready) {
+          reset_idle_wave(&idle_wave, now_ms, 0.0f, 1.0f, 0.0f);
+        }
+        gx = 0.0f;
         gy = 1.0f;
+      }
+      if (should_start_idle_wave(&idle_wave, now_ms)) {
+        const float direction = (esp_random() & 1U) ? 1.0f : -1.0f;
+        const float position = random_float(0.10f, 0.90f);
+        const float strength = random_float(OCEAN_IDLE_WAVE_IMPULSE_MIN,
+                                            OCEAN_IDLE_WAVE_IMPULSE_MAX);
+        ocean_flip_apply_wave_impulse(fluid, gx, gy, position, direction, strength);
       }
       if (profile_this_frame) g_stats.imu_us += esp_timer_get_time() - stage_started_us;
 

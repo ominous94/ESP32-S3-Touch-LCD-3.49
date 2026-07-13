@@ -660,6 +660,70 @@ void ocean_flip_step(OceanFlipFluid* f, float dt, float gx, float gy) {
                         f->AIR_CELL, f->FLUID_CELL, f->SOLID_CELL);
 }
 
+void ocean_flip_apply_wave_impulse(OceanFlipFluid* f, float gravity_x, float gravity_y,
+                                   float position, float direction, float strength) {
+    if (!f || f->num_particles < 1 || !(strength > 0.0f) || !isfinite(strength)) return;
+
+    float gravity_length = sqrtf(gravity_x * gravity_x + gravity_y * gravity_y);
+    if (!(gravity_length > 0.05f) || !isfinite(gravity_length)) {
+        gravity_x = 0.0f;
+        gravity_y = 1.0f;
+        gravity_length = 1.0f;
+    }
+    const float normal_x = gravity_x / gravity_length;
+    const float normal_y = gravity_y / gravity_length;
+    const float tangent_x = -normal_y;
+    const float tangent_y = normal_x;
+
+    position = clamp_f(position, 0.0f, 1.0f);
+    direction = (direction < 0.0f) ? -1.0f : 1.0f;
+    strength = clamp_f(strength, 0.0f, 10.0f);
+
+    const float first_x = f->particle_pos[0];
+    const float first_y = f->particle_pos[1];
+    float min_normal = first_x * normal_x + first_y * normal_y;
+    float max_normal = min_normal;
+    float min_tangent = first_x * tangent_x + first_y * tangent_y;
+    float max_tangent = min_tangent;
+    for (int i = 1; i < f->num_particles; i++) {
+        const float x = f->particle_pos[2 * i + 0];
+        const float y = f->particle_pos[2 * i + 1];
+        const float normal_projection = x * normal_x + y * normal_y;
+        const float tangent_projection = x * tangent_x + y * tangent_y;
+        if (normal_projection < min_normal) min_normal = normal_projection;
+        if (normal_projection > max_normal) max_normal = normal_projection;
+        if (tangent_projection < min_tangent) min_tangent = tangent_projection;
+        if (tangent_projection > max_tangent) max_tangent = tangent_projection;
+    }
+
+    const float width = MAX(max_tangent - min_tangent, f->h);
+    const float depth = MAX(max_normal - min_normal, f->h);
+    const float surface_band = MAX(depth * 0.45f, f->h * 3.0f);
+    const float target_tangent = min_tangent + width * position;
+    const float impulse_radius = MAX(width * 0.35f, f->h * 2.0f);
+    const float max_speed = 15.0f;
+
+    for (int i = 0; i < f->num_particles; i++) {
+        const float x = f->particle_pos[2 * i + 0];
+        const float y = f->particle_pos[2 * i + 1];
+        const float normal_projection = x * normal_x + y * normal_y;
+        const float tangent_projection = x * tangent_x + y * tangent_y;
+        const float surface_weight = 1.0f - clamp_f(
+            (normal_projection - min_normal) / surface_band, 0.0f, 1.0f);
+        const float distance = fabsf(tangent_projection - target_tangent);
+        float location_weight = 1.0f - clamp_f(distance / impulse_radius, 0.0f, 1.0f);
+        location_weight *= location_weight;
+        const float impulse = strength * surface_weight * location_weight * direction;
+
+        float vx = f->particle_vel[2 * i + 0];
+        float vy = f->particle_vel[2 * i + 1];
+        vx += tangent_x * impulse;
+        vy += tangent_y * impulse;
+        f->particle_vel[2 * i + 0] = clamp_f(vx, -max_speed, max_speed);
+        f->particle_vel[2 * i + 1] = clamp_f(vy, -max_speed, max_speed);
+    }
+}
+
 void ocean_flip_get_led_grid(const OceanFlipFluid* f, float* out_grid, int visible_w, int visible_h) {
     if (!f || !out_grid) return;
     if (visible_w < 1 || visible_h < 1) return;

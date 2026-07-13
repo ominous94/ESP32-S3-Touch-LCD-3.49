@@ -22,6 +22,14 @@ void ocean_flip_destroy(OceanFlipFluid* f);
 
 void ocean_flip_step(OceanFlipFluid* f, float dt, float gx, float gy);
 
+// 在随机水面位置施加一次与重力垂直的局部速度冲击。
+// - gravity_x/gravity_y: 当前二维重力方向
+// - position: 沿水面切线方向的归一化位置（0.0 ~ 1.0）
+// - direction: 小于 0 沿反切线方向，大于等于 0 沿正切线方向
+// - strength: 冲击强度（常规建议 0.5 ~ 1.5，验证时可临时提高）
+void ocean_flip_apply_wave_impulse(OceanFlipFluid* f, float gravity_x, float gravity_y,
+                                   float position, float direction, float strength);
+
 // 获取可见网格（布局为 out_grid[x * visible_h + y]）
 void ocean_flip_get_led_grid(const OceanFlipFluid* f, float* out_grid, int visible_w, int visible_h);
 
