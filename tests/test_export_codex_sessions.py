@@ -6,7 +6,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from tools.export_codex_sessions import build_sessions_payload, export_sessions
+from tools.export_codex_sessions import (
+    build_sessions_payload,
+    export_sessions,
+    normalize_codex_limits,
+)
 
 
 STATUS_TITLE = "\u72b6\u6001\u5c4f\u5f00\u53d1"
@@ -19,6 +23,50 @@ ASSISTANT_DETAIL = "\u52a9\u624b\uff1a\u6b63\u5728\u5236\u5b9a\u5b9e\u73b0\u65b9
 
 
 class ExportCodexSessionsTests(unittest.TestCase):
+    def test_normalizes_five_hour_and_weekly_windows_by_duration(self):
+        limits = normalize_codex_limits(
+            {
+                "rateLimitsByLimitId": {
+                    "codex": {
+                        "limitId": "codex",
+                        "primary": {
+                            "usedPercent": 8,
+                            "windowDurationMins": 10080,
+                            "resetsAt": 1784490776,
+                        },
+                        "secondary": {
+                            "usedPercent": 35,
+                            "windowDurationMins": 300,
+                            "resetsAt": 1784472000,
+                        },
+                    }
+                }
+            }
+        )
+
+        self.assertEqual(limits["limits_status"], "ok")
+        self.assertEqual(limits["five_hour_used_percent"], 35)
+        self.assertRegex(limits["five_hour_reset_text"], r"^\d{2}:\d{2}$")
+        self.assertEqual(limits["weekly_used_percent"], 8)
+        self.assertRegex(limits["weekly_reset_text"], r"^\d{2}-\d{2}$")
+
+    def test_missing_five_hour_window_is_explicitly_unavailable(self):
+        limits = normalize_codex_limits(
+            {
+                "rateLimits": {
+                    "primary": {
+                        "usedPercent": 8,
+                        "windowDurationMins": 10080,
+                        "resetsAt": 1784490776,
+                    },
+                    "secondary": None,
+                }
+            }
+        )
+
+        self.assertEqual(limits["five_hour_used_percent"], -1)
+        self.assertEqual(limits["weekly_used_percent"], 8)
+
     def test_build_sessions_payload_reads_recent_codex_session_index(self):
         with TemporaryDirectory() as temp_dir:
             codex_home = Path(temp_dir) / ".codex"
@@ -94,6 +142,7 @@ class ExportCodexSessionsTests(unittest.TestCase):
 
         self.assertEqual(payload["sessions"][0]["title"], STATUS_TITLE)
         self.assertEqual(payload["sessions"][0]["state"], "notLoaded")
+        self.assertIn("codex_limits", payload)
 
     def test_build_sessions_payload_marks_task_complete_rollout_as_complete(self):
         with TemporaryDirectory() as temp_dir:

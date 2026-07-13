@@ -39,6 +39,7 @@ class CodexAppServerStatus:
         self._next_request_id = 1
         self._threads = {}
         self._turn_status = {}
+        self._rate_limits = {}
         self._last_error = ""
 
     @property
@@ -154,6 +155,19 @@ class CodexAppServerStatus:
                 thread["lastTurnStatus"] = turn_status[thread_id]
         return threads
 
+    def refresh_rate_limits(self):
+        """Fetch the current ChatGPT-backed Codex quota windows."""
+        self.start()
+        result = self._request("account/rateLimits/read", {})
+        with self._state_lock:
+            self._rate_limits = copy.deepcopy(result)
+            self._last_error = ""
+        return self.rate_limits_snapshot()
+
+    def rate_limits_snapshot(self):
+        with self._state_lock:
+            return copy.deepcopy(self._rate_limits)
+
     def handle_notification(self, method, params):
         """Apply a server notification. Public to make protocol behavior testable."""
         params = params if isinstance(params, dict) else {}
@@ -171,6 +185,18 @@ class CodexAppServerStatus:
                     status = str(turn.get("status") or "")
                     if status:
                         self._turn_status[thread_id] = status
+            elif method == "account/rateLimits/updated":
+                update = params.get("rateLimits")
+                if isinstance(update, dict):
+                    current = self._rate_limits.setdefault("rateLimits", {})
+                    limit_id = str(update.get("limitId") or "")
+                    current_limit_id = str(current.get("limitId") or "")
+                    if not limit_id or not current_limit_id or limit_id == current_limit_id:
+                        _merge_sparse_dict(current, update)
+                    buckets = self._rate_limits.get("rateLimitsByLimitId")
+                    if limit_id and isinstance(buckets, dict):
+                        bucket = buckets.setdefault(limit_id, {})
+                        _merge_sparse_dict(bucket, update)
 
     def _request(self, method, params, request_id=None):
         if request_id is None:
@@ -250,6 +276,17 @@ class CodexAppServerStatus:
         for waiter in waiters:
             waiter["message"] = {"error": {"message": message}}
             waiter["event"].set()
+
+
+def _merge_sparse_dict(target, update):
+    """Merge an App Server sparse notification without clearing null metadata."""
+    for key, value in update.items():
+        if value is None:
+            continue
+        if isinstance(value, dict) and isinstance(target.get(key), dict):
+            _merge_sparse_dict(target[key], value)
+        else:
+            target[key] = copy.deepcopy(value)
 
 
 def app_server_thread_to_entry(thread):

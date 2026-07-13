@@ -59,6 +59,28 @@ def _normalize_session(session, payload_updated_at):
     }
 
 
+def _normalize_codex_limits(source):
+    limits = source.get("codex_limits") if isinstance(source, dict) else None
+    if not isinstance(limits, dict):
+        limits = {}
+
+    def percent_value(key):
+        try:
+            value = int(limits.get(key, -1))
+        except (TypeError, ValueError):
+            return -1
+        return value if 0 <= value <= 100 else -1
+
+    return {
+        "limits_status": _string_value(limits.get("limits_status"), "unavailable"),
+        "limits_error": _string_value(limits.get("limits_error")),
+        "five_hour_used_percent": percent_value("five_hour_used_percent"),
+        "five_hour_reset_text": _string_value(limits.get("five_hour_reset_text")),
+        "weekly_used_percent": percent_value("weekly_used_percent"),
+        "weekly_reset_text": _string_value(limits.get("weekly_reset_text")),
+    }
+
+
 def build_status_payload(sessions_file=None, stale_after=15.0):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     source = _load_sessions_file(sessions_file)
@@ -69,6 +91,7 @@ def build_status_payload(sessions_file=None, stale_after=15.0):
             "source_status": "error",
             "source_error": "状态快照不存在或无法解析",
             "source_age_ms": -1,
+            "codex_limits": _normalize_codex_limits({}),
             "sessions": [],
         }
 
@@ -92,6 +115,7 @@ def build_status_payload(sessions_file=None, stale_after=15.0):
         "source_status": source_status,
         "source_error": _string_value(source.get("source_error")),
         "source_age_ms": source_age_ms,
+        "codex_limits": _normalize_codex_limits(source),
         "sessions": [_normalize_session(session, updated_at) for session in sessions],
     }
 

@@ -34,6 +34,13 @@ class CodexStatusBridgeTests(unittest.TestCase):
                 json.dumps(
                     {
                         "updated_at": "2026-06-12 09:30:00",
+                        "codex_limits": {
+                            "limits_status": "ok",
+                            "five_hour_used_percent": 35,
+                            "five_hour_reset_text": "14:30",
+                            "weekly_used_percent": 8,
+                            "weekly_reset_text": "07-20",
+                        },
                         "sessions": [
                             {
                                 "id": "thread-active",
@@ -66,6 +73,9 @@ class CodexStatusBridgeTests(unittest.TestCase):
         self.assertEqual(first["cwd"], "ESP32-S3-Touch-LCD-3.49")
         self.assertEqual(first["status_source"], "appServer")
         self.assertEqual(payload["source_status"], "degraded")
+        self.assertEqual(payload["codex_limits"]["limits_status"], "ok")
+        self.assertEqual(payload["codex_limits"]["five_hour_used_percent"], 35)
+        self.assertEqual(payload["codex_limits"]["weekly_used_percent"], 8)
 
         second = payload["sessions"][1]
         self.assertEqual(second["title"], UNTITLED_ZH)

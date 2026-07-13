@@ -42,6 +42,8 @@ static lv_obj_t *primary_status_dot = NULL;
 static lv_obj_t *primary_status_label = NULL;
 static lv_obj_t *primary_title_label = NULL;
 static lv_obj_t *primary_meta_label = NULL;
+static lv_obj_t *limit_bars[2] = {};
+static lv_obj_t *limit_value_labels[2] = {};
 static lv_obj_t *secondary_cards[2] = {};
 static lv_obj_t *secondary_dots[2] = {};
 static lv_obj_t *secondary_statuses[2] = {};
@@ -70,11 +72,24 @@ struct CodexSession {
   String last_user_at;
 };
 
+struct CodexLimitWindow {
+  int used_percent = -1;
+  String reset_text;
+};
+
+struct CodexLimits {
+  String status;
+  String error;
+  CodexLimitWindow five_hour;
+  CodexLimitWindow weekly;
+};
+
 struct CodexStatus {
   String updated_at;
   String source;
   String source_status;
   String source_error;
+  CodexLimits limits;
   int session_count;
   CodexSession sessions[5];
 };
@@ -136,6 +151,9 @@ static void log_status_snapshot(const char *connection, const CodexStatus &statu
   log_serial_field("source", status.source);
   log_serial_field("source_status", status.source_status);
   log_serial_field("updated_at", status.updated_at.length() ? status.updated_at : "--");
+  log_serial_field("limits_status", status.limits.status);
+  log_serial_field("five_hour_used", status.limits.five_hour.used_percent);
+  log_serial_field("weekly_used", status.limits.weekly.used_percent);
   log_serial_field("heap", (int)ESP.getFreeHeap()); Serial.println();
   for (int i = 0; i < status.session_count; ++i) {
     const CodexSession &s = status.sessions[i];
@@ -170,6 +188,32 @@ static String json_string_value(const String &json, const char *key) {
   }
   return "";
 }
+static int json_int_value(const String &json, const char *key, int default_value) {
+  String needle = String("\"") + key + "\"";
+  int key_pos = json.indexOf(needle);
+  if (key_pos < 0) return default_value;
+  int colon_pos = json.indexOf(':', key_pos + needle.length());
+  if (colon_pos < 0) return default_value;
+  int value_pos = colon_pos + 1;
+  while (value_pos < json.length()) {
+    char c = json.charAt(value_pos);
+    if (c != ' ' && c != '\t' && c != '\r' && c != '\n') break;
+    value_pos++;
+  }
+  bool negative = value_pos < json.length() && json.charAt(value_pos) == '-';
+  if (negative) value_pos++;
+  int value = 0;
+  bool has_digit = false;
+  while (value_pos < json.length()) {
+    char c = json.charAt(value_pos);
+    if (c < '0' || c > '9') break;
+    has_digit = true;
+    value = value * 10 + (c - '0');
+    value_pos++;
+  }
+  if (!has_digit) return default_value;
+  return negative ? -value : value;
+}
 static int json_object_end(const String &json, int object_start) {
   int depth = 0; bool in_string = false, escaped = false;
   for (int i = object_start; i < json.length(); ++i) {
@@ -192,6 +236,12 @@ static CodexStatus parse_status_json(const String &json) {
   status.source = json_string_value(json, "source");
   status.source_status = json_string_value(json, "source_status");
   status.source_error = json_string_value(json, "source_error");
+  status.limits.status = json_string_value(json, "limits_status");
+  status.limits.error = json_string_value(json, "limits_error");
+  status.limits.five_hour.used_percent = json_int_value(json, "five_hour_used_percent", -1);
+  status.limits.five_hour.reset_text = json_string_value(json, "five_hour_reset_text");
+  status.limits.weekly.used_percent = json_int_value(json, "weekly_used_percent", -1);
+  status.limits.weekly.reset_text = json_string_value(json, "weekly_reset_text");
   status.session_count = 0;
   int sessions_pos = json.indexOf("\"sessions\"");
   if (sessions_pos < 0) return status;
@@ -330,6 +380,38 @@ static lv_color_t state_color(const String &state) {
   if (state == "blocked") return lv_color_hex(0xFF7E7E);
   if (state == "notLoaded") return lv_color_hex(0xF0C86F);
   return lv_color_hex(0x8FA1AD);
+}
+
+static lv_color_t limit_remaining_color(int remaining_percent) {
+  if (remaining_percent < 20) return lv_color_hex(0xFF7E7E);
+  if (remaining_percent < 50) return lv_color_hex(0xF0C86F);
+  return lv_color_hex(0x78F0A4);
+}
+
+static void bind_limit_window_locked(int slot, const CodexLimitWindow &window, bool stale) {
+  if (slot < 0 || slot >= 2 || limit_bars[slot] == NULL || limit_value_labels[slot] == NULL) return;
+  if (window.used_percent < 0 || window.used_percent > 100) {
+    lv_bar_set_value(limit_bars[slot], 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(limit_bars[slot], lv_color_hex(0x56636D), LV_PART_INDICATOR);
+    lv_obj_set_style_text_color(limit_value_labels[slot], lv_color_hex(0x8FA1AD), 0);
+    set_label_text(limit_value_labels[slot], "暂无");
+    return;
+  }
+
+  int remaining_percent = 100 - window.used_percent;
+  lv_color_t color = stale ? lv_color_hex(0xF0C86F) : limit_remaining_color(remaining_percent);
+  lv_bar_set_value(limit_bars[slot], remaining_percent, LV_ANIM_OFF);
+  lv_obj_set_style_bg_color(limit_bars[slot], color, LV_PART_INDICATOR);
+  lv_obj_set_style_text_color(limit_value_labels[slot], color, 0);
+  String value = String(remaining_percent) + "%";
+  if (window.reset_text.length()) value += " " + window.reset_text;
+  set_label_text(limit_value_labels[slot], value);
+}
+
+static void bind_limits_locked(const CodexLimits &limits) {
+  bool stale = limits.status == "stale";
+  bind_limit_window_locked(0, limits.five_hour, stale);
+  bind_limit_window_locked(1, limits.weekly, stale);
 }
 
 static int state_rank(const String &state) {
@@ -708,6 +790,46 @@ static void render_home_ui_locked() {
   lv_obj_set_height(primary_meta_label, 18);
   lv_label_set_long_mode(primary_meta_label, LV_LABEL_LONG_DOT);
 
+  lv_obj_t *limit_divider = lv_obj_create(pp);
+  make_touch_event_bubble(limit_divider);
+  lv_obj_set_size(limit_divider, PRIMARY_TEXT_W, 1);
+  lv_obj_clear_flag(limit_divider, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_style_bg_color(limit_divider, lv_color_hex(0x34414A), 0);
+  lv_obj_set_style_border_width(limit_divider, 0, 0);
+  lv_obj_set_style_radius(limit_divider, 0, 0);
+  lv_obj_set_style_pad_all(limit_divider, 0, 0);
+
+  const char *limit_names[2] = {"5小时余", "每周余"};
+  for (int i = 0; i < 2; ++i) {
+    lv_obj_t *limit_row = lv_obj_create(pp);
+    make_touch_event_bubble(limit_row);
+    lv_obj_set_size(limit_row, PRIMARY_TEXT_W, 24);
+    lv_obj_clear_flag(limit_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_opa(limit_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(limit_row, 0, 0);
+    lv_obj_set_style_pad_all(limit_row, 0, 0);
+    lv_obj_set_style_pad_column(limit_row, 6, 0);
+    lv_obj_set_flex_flow(limit_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(limit_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *limit_name = create_label(limit_row, limit_names[i], lv_color_hex(0xC6D1D8), 58);
+    make_touch_event_bubble(limit_name);
+
+    limit_bars[i] = lv_bar_create(limit_row);
+    make_touch_event_bubble(limit_bars[i]);
+    lv_obj_set_size(limit_bars[i], 118, 8);
+    lv_bar_set_range(limit_bars[i], 0, 100);
+    lv_bar_set_value(limit_bars[i], 0, LV_ANIM_OFF);
+    lv_obj_set_style_radius(limit_bars[i], LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_radius(limit_bars[i], LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(limit_bars[i], lv_color_hex(0x26313A), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(limit_bars[i], lv_color_hex(0x56636D), LV_PART_INDICATOR);
+
+    limit_value_labels[i] = create_label(limit_row, "暂无", lv_color_hex(0x8FA1AD), 112);
+    make_touch_event_bubble(limit_value_labels[i]);
+    lv_label_set_long_mode(limit_value_labels[i], LV_LABEL_LONG_DOT);
+  }
+
   /* Secondary panel */
   lv_obj_t *sp = lv_obj_create(g_app_scr);
   lv_obj_set_size(sp, SECONDARY_PANEL_W, PANEL_H);
@@ -765,6 +887,7 @@ static void render_home_ui_locked() {
 /* ========== Status Binding ========== */
 static void bind_home_status_locked(const char *connection, const CodexStatus &status, const String just_completed_ids[], int just_completed_count) {
   set_label_text(connection_label, String("网络：") + connection);
+  bind_limits_locked(status.limits);
 
   int order[3] = {};
   build_visible_session_order(status, order);
@@ -945,6 +1068,9 @@ void app_codex_destroy(lv_obj_t *scr) {
   connection_label = NULL; assistant_image = NULL; companion_state_label = NULL;
   primary_status_dot = NULL; primary_status_label = NULL;
   primary_title_label = NULL; primary_meta_label = NULL;
+  for (int i = 0; i < 2; i++) {
+    limit_bars[i] = NULL; limit_value_labels[i] = NULL;
+  }
   for (int i = 0; i < SECONDARY_SESSIONS; i++) {
     secondary_cards[i] = NULL; secondary_dots[i] = NULL;
     secondary_statuses[i] = NULL; secondary_titles[i] = NULL;

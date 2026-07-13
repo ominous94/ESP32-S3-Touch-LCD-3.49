@@ -26,6 +26,84 @@ STATE_LABELS_ZH = {
     "complete": "\u5df2\u5b8c\u6210",
     "blocked": "\u5df2\u963b\u585e",
 }
+
+FIVE_HOUR_WINDOW_MINS = 5 * 60
+WEEKLY_WINDOW_MINS = 7 * 24 * 60
+RATE_LIMIT_REFRESH_INTERVAL = 60.0
+
+
+def _rate_limit_snapshot(response):
+    if not isinstance(response, dict):
+        return None
+    buckets = response.get("rateLimitsByLimitId")
+    if isinstance(buckets, dict) and isinstance(buckets.get("codex"), dict):
+        return buckets["codex"]
+    snapshot = response.get("rateLimits")
+    if isinstance(snapshot, dict):
+        return snapshot
+    if "primary" in response or "secondary" in response:
+        return response
+    return None
+
+
+def _window_for_duration(snapshot, duration_mins):
+    if not isinstance(snapshot, dict):
+        return None
+    for key in ("primary", "secondary"):
+        window = snapshot.get(key)
+        if not isinstance(window, dict):
+            continue
+        try:
+            duration = int(window.get("windowDurationMins"))
+        except (TypeError, ValueError):
+            continue
+        if duration == duration_mins:
+            return window
+    return None
+
+
+def _window_fields(window, duration_mins):
+    if not isinstance(window, dict):
+        return -1, ""
+    try:
+        used_percent = max(0, min(100, int(window.get("usedPercent"))))
+    except (TypeError, ValueError):
+        return -1, ""
+
+    reset_text = ""
+    try:
+        reset_time = datetime.fromtimestamp(int(window.get("resetsAt"))).astimezone()
+        reset_text = reset_time.strftime(
+            "%H:%M" if duration_mins == FIVE_HOUR_WINDOW_MINS else "%m-%d"
+        )
+    except (TypeError, ValueError, OSError, OverflowError):
+        pass
+    return used_percent, reset_text
+
+
+def normalize_codex_limits(response=None, error=""):
+    snapshot = _rate_limit_snapshot(response)
+    five_hour = _window_for_duration(snapshot, FIVE_HOUR_WINDOW_MINS)
+    weekly = _window_for_duration(snapshot, WEEKLY_WINDOW_MINS)
+    five_hour_used, five_hour_reset = _window_fields(
+        five_hour, FIVE_HOUR_WINDOW_MINS
+    )
+    weekly_used, weekly_reset = _window_fields(weekly, WEEKLY_WINDOW_MINS)
+
+    if snapshot is None:
+        status = "error" if error else "unavailable"
+    elif error:
+        status = "stale"
+    else:
+        status = "ok"
+    return {
+        "limits_status": status,
+        "limits_error": str(error or ""),
+        "five_hour_used_percent": five_hour_used,
+        "five_hour_reset_text": five_hour_reset,
+        "weekly_used_percent": weekly_used,
+        "weekly_reset_text": weekly_reset,
+    }
 MAX_SCREEN_TITLE_CHARS = 24
 ACTIVE_RECENT_SECONDS = 120
 COMPLETE_VISIBLE_SECONDS = 600
@@ -415,6 +493,8 @@ def build_sessions_payload(
     now=None,
     app_server_threads=None,
     app_server_error="",
+    rate_limits=None,
+    rate_limits_error="",
 ):
     codex_home = Path(codex_home) if codex_home else _default_codex_home()
     state = _read_json_file(codex_home / ".codex-global-state.json")
@@ -508,6 +588,7 @@ def build_sessions_payload(
         "source": source,
         "source_status": source_status,
         "source_error": str(app_server_error or ""),
+        "codex_limits": normalize_codex_limits(rate_limits, rate_limits_error),
         "sessions": sessions,
     }
 
@@ -538,6 +619,8 @@ def export_sessions(
     limit=5,
     app_server_threads=None,
     app_server_error="",
+    rate_limits=None,
+    rate_limits_error="",
 ):
     output_path = Path(output_file)
     payload = build_sessions_payload(
@@ -545,6 +628,8 @@ def export_sessions(
         limit=limit,
         app_server_threads=app_server_threads,
         app_server_error=app_server_error,
+        rate_limits=rate_limits,
+        rate_limits_error=rate_limits_error,
     )
     _atomic_write(output_path, json.dumps(payload, ensure_ascii=False, indent=2))
     return payload
@@ -571,6 +656,9 @@ def main():
     args = parser.parse_args()
 
     app_server = None if args.legacy_only else CodexAppServerStatus()
+    rate_limits = None
+    rate_limits_error = ""
+    last_rate_limit_refresh = 0.0
     cycle = 0
     try:
         while True:
@@ -583,12 +671,33 @@ def main():
                     app_server_error = str(exc)
                     app_server_threads = []
                     app_server.close()
+                if not app_server_error:
+                    now_monotonic = time.monotonic()
+                    if (
+                        rate_limits is None
+                        or now_monotonic - last_rate_limit_refresh
+                        >= RATE_LIMIT_REFRESH_INTERVAL
+                    ):
+                        last_rate_limit_refresh = now_monotonic
+                        try:
+                            rate_limits = app_server.refresh_rate_limits()
+                            rate_limits_error = ""
+                        except CodexAppServerError as exc:
+                            rate_limits_error = str(exc)
+                    else:
+                        updated_limits = app_server.rate_limits_snapshot()
+                        if updated_limits:
+                            rate_limits = updated_limits
+                else:
+                    rate_limits_error = app_server_error
             payload = export_sessions(
                 codex_home=args.codex_home,
                 output_file=args.output,
                 limit=args.limit,
                 app_server_threads=app_server_threads,
                 app_server_error=app_server_error,
+                rate_limits=rate_limits,
+                rate_limits_error=rate_limits_error,
             )
             cycle += 1
             if args.log_every <= 1 or cycle % args.log_every == 0:
