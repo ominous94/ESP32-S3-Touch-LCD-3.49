@@ -22,6 +22,13 @@ void ocean_flip_destroy(OceanFlipFluid* f);
 
 void ocean_flip_step(OceanFlipFluid* f, float dt, float gx, float gy);
 
+// 在随设备旋转的二维参考系中推进模拟。
+// - angular_velocity: 绕屏幕法向的角速度，单位 rad/s
+// - angular_acceleration: 对应角加速度，单位 rad/s^2
+// 求解器会逐粒子加入切向惯性、离心和科里奥利分量。
+void ocean_flip_step_rotating(OceanFlipFluid* f, float dt, float gx, float gy,
+                              float angular_velocity, float angular_acceleration);
+
 // 在随机水面位置施加一次与重力垂直的局部速度冲击。
 // - gravity_x/gravity_y: 当前二维重力方向
 // - position: 沿水面切线方向的归一化位置（0.0 ~ 1.0）

@@ -20,6 +20,8 @@
 #define LED_VAL_MAX_F 20.0f
 #define DENSITY_CLAMP_F 1.2f
 #define GAMMA_F 0.6f
+#define ROTATION_FORCE_SCALE_F 0.10f
+#define ROTATION_ACCEL_MAX_F 9.81f
 
 // gamma LUT
 static bool s_gamma_inited = false;
@@ -83,14 +85,39 @@ static float rand01(void) {
     return (float)rand() / (float)RAND_MAX;
 }
 
-static void integrate_particles(int n, float* pos, float* vel, float dt, float gx, float gy) {
-    const float dgx = gx * dt;
-    const float dgy = gy * dt;
+static void integrate_particles(int n, float* pos, float* vel, float dt,
+                                float gx, float gy, float center_x, float center_y,
+                                float angular_velocity, float angular_acceleration) {
+    const float omega_squared = angular_velocity * angular_velocity;
     for (int i = 0; i < n; i++) {
-        vel[2 * i + 0] += dgx;
-        vel[2 * i + 1] += dgy;
-        pos[2 * i + 0] += vel[2 * i + 0] * dt;
-        pos[2 * i + 1] += vel[2 * i + 1] * dt;
+        float vx = vel[2 * i + 0];
+        float vy = vel[2 * i + 1];
+        const float relative_x = pos[2 * i + 0] - center_x;
+        const float relative_y = pos[2 * i + 1] - center_y;
+
+        // 设备参考系中的 Euler、离心和 Coriolis 惯性加速度。
+        float rotation_ax = angular_acceleration * relative_y
+                          + omega_squared * relative_x
+                          + 2.0f * angular_velocity * vy;
+        float rotation_ay = -angular_acceleration * relative_x
+                          + omega_squared * relative_y
+                          - 2.0f * angular_velocity * vx;
+        rotation_ax *= ROTATION_FORCE_SCALE_F;
+        rotation_ay *= ROTATION_FORCE_SCALE_F;
+
+        const float rotation_length = sqrtf(rotation_ax * rotation_ax + rotation_ay * rotation_ay);
+        if (rotation_length > ROTATION_ACCEL_MAX_F && isfinite(rotation_length)) {
+            const float scale = ROTATION_ACCEL_MAX_F / rotation_length;
+            rotation_ax *= scale;
+            rotation_ay *= scale;
+        }
+
+        vx += (gx + rotation_ax) * dt;
+        vy += (gy + rotation_ay) * dt;
+        vel[2 * i + 0] = vx;
+        vel[2 * i + 1] = vy;
+        pos[2 * i + 0] += vx * dt;
+        pos[2 * i + 1] += vy * dt;
     }
 }
 
@@ -627,12 +654,21 @@ void ocean_flip_destroy(OceanFlipFluid* f) {
 }
 
 void ocean_flip_step(OceanFlipFluid* f, float dt, float gx, float gy) {
+    ocean_flip_step_rotating(f, dt, gx, gy, 0.0f, 0.0f);
+}
+
+void ocean_flip_step_rotating(OceanFlipFluid* f, float dt, float gx, float gy,
+                              float angular_velocity, float angular_acceleration) {
     if (!f) return;
 
     float Gx = gx * f->gravity_scale;
     float Gy = gy * f->gravity_scale;
+    const float center_x = 0.5f * f->f_num_x * f->h;
+    const float center_y = 0.5f * f->f_num_y * f->h;
 
-    integrate_particles(f->num_particles, f->particle_pos, f->particle_vel, dt, Gx, Gy);
+    integrate_particles(f->num_particles, f->particle_pos, f->particle_vel, dt,
+                        Gx, Gy, center_x, center_y,
+                        angular_velocity, angular_acceleration);
     push_particles_apart(f->num_particles, f->particle_pos, f->particle_radius,
                          f->p_inv_spacing, f->p_num_x, f->p_num_y,
                          f->num_cell_particles, f->first_cell_particle,

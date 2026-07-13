@@ -16,7 +16,17 @@ namespace {
 constexpr int OCEAN_LEVEL_MAX = 20;
 constexpr uint32_t OCEAN_FRAME_MS = 33;
 constexpr float OCEAN_ACCEL_SCALE = 4.0f / 32768.0f;
-constexpr float OCEAN_ACCEL_ALPHA = 0.30f;
+constexpr float OCEAN_GRAVITY_ALPHA = 0.06f;
+constexpr float OCEAN_SHAKE_ALPHA = 0.45f;
+constexpr float OCEAN_SHAKE_GAIN = 1.60f;
+constexpr float OCEAN_SHAKE_DEADZONE_G = 0.04f;
+constexpr float OCEAN_EFFECTIVE_ACCEL_MAX_G = 2.50f;
+constexpr float OCEAN_GYRO_SCALE_RAD_S = (1024.0f / 32768.0f) * (PI / 180.0f);
+constexpr float OCEAN_GYRO_ALPHA = 0.35f;
+constexpr float OCEAN_ANGULAR_ACCEL_ALPHA = 0.25f;
+constexpr float OCEAN_GYRO_DEADZONE_RAD_S = 2.0f * (PI / 180.0f);
+constexpr float OCEAN_ANGULAR_SPEED_MAX_RAD_S = 6.0f;
+constexpr float OCEAN_ANGULAR_ACCEL_MAX_RAD_S2 = 30.0f;
 constexpr uint32_t OCEAN_PROFILE_FRAMES = 120;
 constexpr uint32_t OCEAN_IDLE_WAVE_GAP_MIN_MS = 4000;
 constexpr uint32_t OCEAN_IDLE_WAVE_GAP_MAX_MS = 9000;
@@ -101,10 +111,12 @@ static const uint32_t OCEAN_THEME_PREVIEWS[OCEAN_THEME_COUNT] = {
 constexpr uint8_t OCEAN_QMI_REG_WHOAMI = 0x00;
 constexpr uint8_t OCEAN_QMI_REG_CTRL1 = 0x02;
 constexpr uint8_t OCEAN_QMI_REG_CTRL2 = 0x03;
+constexpr uint8_t OCEAN_QMI_REG_CTRL3 = 0x04;
 constexpr uint8_t OCEAN_QMI_REG_CTRL5 = 0x06;
 constexpr uint8_t OCEAN_QMI_REG_CTRL7 = 0x08;
 constexpr uint8_t OCEAN_QMI_REG_STATUS0 = 0x2E;
 constexpr uint8_t OCEAN_QMI_REG_AX_L = 0x35;
+constexpr uint8_t OCEAN_QMI_REG_GZ_L = 0x3F;
 constexpr uint8_t OCEAN_QMI_REG_RESET = 0x60;
 constexpr uint8_t OCEAN_QMI_WHOAMI_VALUE = 0x05;
 
@@ -142,16 +154,18 @@ static bool ocean_imu_init()
   uint8_t who_am_i = 0;
   if (!imu_read(OCEAN_QMI_REG_WHOAMI, &who_am_i, 1) || who_am_i != OCEAN_QMI_WHOAMI_VALUE) return false;
 
-  // 自动递增地址、小端；加速度量程 ±4g、ODR 1000Hz，并启用低通滤波。
+  // 自动递增地址、小端；加速度 ±4g，陀螺仪 ±1024dps，并启用低通滤波。
   if (!imu_write(OCEAN_QMI_REG_CTRL1, 0x40)) return false;
   if (!imu_write(OCEAN_QMI_REG_CTRL2, 0x13)) return false;
+  if (!imu_write(OCEAN_QMI_REG_CTRL3, 0x63)) return false;
   if (!imu_write(OCEAN_QMI_REG_CTRL5, 0x11)) return false;
-  if (!imu_write(OCEAN_QMI_REG_CTRL7, 0x01)) return false;
+  if (!imu_write(OCEAN_QMI_REG_CTRL7, 0x03)) return false;
   delay(50);
   return true;
 }
 
-static bool ocean_read_gravity(float *gx, float *gy, float *gz)
+static bool ocean_read_motion(float *gx, float *gy, float *gz,
+                              float *angular_velocity, bool *gyro_sample_ready)
 {
   uint8_t status = 0;
   if (!imu_read(OCEAN_QMI_REG_STATUS0, &status, 1) || !(status & 0x01)) return false;
@@ -169,7 +183,49 @@ static bool ocean_read_gravity(float *gx, float *gy, float *gz)
   *gx = ay;
   *gy = ax;
   *gz = az;
+
+  *gyro_sample_ready = false;
+  if (status & 0x02) {
+    uint8_t gyro_data[2];
+    if (imu_read(OCEAN_QMI_REG_GZ_L, gyro_data, sizeof(gyro_data))) {
+      const int16_t raw_gz = (int16_t)(((uint16_t)gyro_data[1] << 8) | gyro_data[0]);
+      // 屏幕 X/Y 映射交换了传感器 X/Y，法向轴方向因此与传感器 Z 相反。
+      *angular_velocity = -(float)raw_gz * OCEAN_GYRO_SCALE_RAD_S;
+      *gyro_sample_ready = true;
+    }
+  }
   return true;
+}
+
+static float apply_accel_deadzone(float value)
+{
+  const float magnitude = fabsf(value);
+  if (magnitude <= OCEAN_SHAKE_DEADZONE_G) return 0.0f;
+  return copysignf(magnitude - OCEAN_SHAKE_DEADZONE_G, value);
+}
+
+static void clamp_accel_vector(float *x, float *y)
+{
+  const float length = sqrtf(*x * *x + *y * *y);
+  if (length > OCEAN_EFFECTIVE_ACCEL_MAX_G && isfinite(length)) {
+    const float scale = OCEAN_EFFECTIVE_ACCEL_MAX_G / length;
+    *x *= scale;
+    *y *= scale;
+  }
+}
+
+static float apply_gyro_deadzone(float value)
+{
+  const float magnitude = fabsf(value);
+  if (magnitude <= OCEAN_GYRO_DEADZONE_RAD_S) return 0.0f;
+  return copysignf(magnitude - OCEAN_GYRO_DEADZONE_RAD_S, value);
+}
+
+static float clamp_signed(float value, float limit)
+{
+  if (value > limit) return limit;
+  if (value < -limit) return -limit;
+  return value;
 }
 
 static float random_float(float min_value, float max_value)
@@ -326,9 +382,14 @@ static void ocean_sim_task(void *arg)
     fluid = ocean_flip_create(sim_w, sim_h, config->grid_w, config->grid_h, 0.60f);
   }
   const bool imu_ready = ocean_imu_init();
-  float filtered_gx = 0.0f;
-  float filtered_gy = 1.0f;
+  float gravity_gx = 0.0f;
+  float gravity_gy = 1.0f;
+  float shake_gx = 0.0f;
+  float shake_gy = 0.0f;
+  float angular_velocity = 0.0f;
+  float angular_acceleration = 0.0f;
   bool gravity_initialized = false;
+  bool gyro_initialized = false;
   OceanIdleWaveState idle_wave = {};
   memset(&g_stats, 0, sizeof(g_stats));
   Serial.println(imu_ready ? "OCEAN imu_ready chip=QMI8658" : "OCEAN imu_failed fallback=synthetic");
@@ -348,27 +409,68 @@ static void ocean_sim_task(void *arg)
       TickType_t frame_started_ticks = xTaskGetTickCount();
       const bool profile_this_frame = g_stats.frames < OCEAN_PROFILE_FRAMES;
       uint64_t stage_started_us = profile_this_frame ? esp_timer_get_time() : 0;
-      float gx = filtered_gx;
-      float gy = filtered_gy;
+      float gx = gravity_gx + shake_gx * OCEAN_SHAKE_GAIN;
+      float gy = gravity_gy + shake_gy * OCEAN_SHAKE_GAIN;
       const uint32_t now_ms = millis();
       if (imu_ready) {
         float measured_gx = 0.0f;
         float measured_gy = 0.0f;
         float measured_gz = 0.0f;
-        if (ocean_read_gravity(&measured_gx, &measured_gy, &measured_gz)) {
+        float measured_angular_velocity = 0.0f;
+        bool gyro_sample_ready = false;
+        if (ocean_read_motion(&measured_gx, &measured_gy, &measured_gz,
+                              &measured_angular_velocity, &gyro_sample_ready)) {
           if (settings.random_waves) {
             update_stationary_state(&idle_wave, now_ms, measured_gx, measured_gy, measured_gz);
           }
           if (!gravity_initialized) {
-            filtered_gx = measured_gx;
-            filtered_gy = measured_gy;
+            gravity_gx = measured_gx;
+            gravity_gy = measured_gy;
+            shake_gx = 0.0f;
+            shake_gy = 0.0f;
             gravity_initialized = true;
           } else {
-            filtered_gx += (measured_gx - filtered_gx) * OCEAN_ACCEL_ALPHA;
-            filtered_gy += (measured_gy - filtered_gy) * OCEAN_ACCEL_ALPHA;
+            gravity_gx += (measured_gx - gravity_gx) * OCEAN_GRAVITY_ALPHA;
+            gravity_gy += (measured_gy - gravity_gy) * OCEAN_GRAVITY_ALPHA;
+
+            const float raw_shake_x = apply_accel_deadzone(measured_gx - gravity_gx);
+            const float raw_shake_y = apply_accel_deadzone(measured_gy - gravity_gy);
+            shake_gx += (raw_shake_x - shake_gx) * OCEAN_SHAKE_ALPHA;
+            shake_gy += (raw_shake_y - shake_gy) * OCEAN_SHAKE_ALPHA;
           }
-          gx = filtered_gx;
-          gy = filtered_gy;
+          gx = gravity_gx + shake_gx * OCEAN_SHAKE_GAIN;
+          gy = gravity_gy + shake_gy * OCEAN_SHAKE_GAIN;
+          clamp_accel_vector(&gx, &gy);
+
+          if (gyro_sample_ready) {
+            measured_angular_velocity = clamp_signed(
+                apply_gyro_deadzone(measured_angular_velocity),
+                OCEAN_ANGULAR_SPEED_MAX_RAD_S);
+            if (!gyro_initialized) {
+              angular_velocity = measured_angular_velocity;
+              angular_acceleration = 0.0f;
+              gyro_initialized = true;
+            } else {
+              const float previous_velocity = angular_velocity;
+              angular_velocity += (measured_angular_velocity - angular_velocity) * OCEAN_GYRO_ALPHA;
+              const float measured_angular_acceleration = clamp_signed(
+                  (angular_velocity - previous_velocity) / dt,
+                  OCEAN_ANGULAR_ACCEL_MAX_RAD_S2);
+              angular_acceleration +=
+                  (measured_angular_acceleration - angular_acceleration) * OCEAN_ANGULAR_ACCEL_ALPHA;
+            }
+          } else {
+            angular_velocity *= 1.0f - OCEAN_GYRO_ALPHA;
+            angular_acceleration *= 1.0f - OCEAN_ANGULAR_ACCEL_ALPHA;
+          }
+        } else {
+          shake_gx *= 1.0f - OCEAN_SHAKE_ALPHA;
+          shake_gy *= 1.0f - OCEAN_SHAKE_ALPHA;
+          angular_velocity *= 1.0f - OCEAN_GYRO_ALPHA;
+          angular_acceleration *= 1.0f - OCEAN_ANGULAR_ACCEL_ALPHA;
+          gx = gravity_gx + shake_gx * OCEAN_SHAKE_GAIN;
+          gy = gravity_gy + shake_gy * OCEAN_SHAKE_GAIN;
+          clamp_accel_vector(&gx, &gy);
         }
       } else {
         if (settings.random_waves && !idle_wave.motion_reference_ready) {
@@ -389,7 +491,8 @@ static void ocean_sim_task(void *arg)
       if (profile_this_frame) g_stats.imu_us += esp_timer_get_time() - stage_started_us;
 
       if (profile_this_frame) stage_started_us = esp_timer_get_time();
-      ocean_flip_step(fluid, dt, gx, gy);
+      ocean_flip_step_rotating(fluid, dt, gx, gy,
+                               angular_velocity, angular_acceleration);
       ocean_flip_get_led_grid(fluid, grid, config->grid_w, config->grid_h);
       map_grid_colors(config, grid, colors);
       if (profile_this_frame) g_stats.flip_us += esp_timer_get_time() - stage_started_us;
